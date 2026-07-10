@@ -15,8 +15,8 @@
  *   - Manual override: force ON / OFF / AUTO
  *
  * APIs used:
- *   - WorldTimeAPI  (http://worldtimeapi.org)  — current time
- *   - sunrise-sunset.org                        — sunset/sunrise times
+ *   - timeapi.io          (https://timeapi.io)        — current time
+ *   - sunrise-sunset.org                              — sunset/sunrise times
  *
  * Hardware:
  *   - ESP32-S3 SuperMini
@@ -174,7 +174,7 @@ void connectWiFi() {
 }
 
 // ═════════════════════════════════════════════════
-// HTTP: Sync current time from WorldTimeAPI
+// HTTP: Sync current time from timeapi.io
 // ═════════════════════════════════════════════════
 void syncTime() {
     if (WiFi.status() != WL_CONNECTED) {
@@ -194,13 +194,12 @@ void syncTime() {
         DeserializationError err = deserializeJson(doc, payload);
 
         if (!err) {
-            const char* dt = doc["datetime"];        // "2026-06-26T14:30:00.123456-06:00"
-            int rawOffset = doc["raw_offset"];        // seconds offset from UTC
-            int dstOffset = doc["dst_offset"];        // DST offset
-            const char* abbrev = doc["abbreviation"]; // "CST", "CDT", etc.
+            const char* dt = doc["date_time"];       // "2026-07-10T16:19:26.627199-06:00"
+            int utcOffset = doc["utc_offset_seconds"];// seconds offset from UTC
+            bool dstActive = doc["dst_active"];       // true if DST is in effect
 
             // Parse ISO datetime to epoch (simple approach: extract and use mktime)
-            // Format: "2026-06-26T14:30:00.123456-06:00"
+            // Format: "2026-07-10T16:19:26.627199-06:00"
             struct tm t = {};
             t.tm_year = atoi(String(dt).substring(0, 4).c_str()) - 1900;
             t.tm_mon  = atoi(String(dt).substring(5, 7).c_str()) - 1;
@@ -208,14 +207,14 @@ void syncTime() {
             t.tm_hour = atoi(String(dt).substring(11, 13).c_str());
             t.tm_min  = atoi(String(dt).substring(14, 16).c_str());
             t.tm_sec  = atoi(String(dt).substring(17, 19).c_str());
-            t.tm_isdst = (dstOffset > 0) ? 1 : 0;
+            t.tm_isdst = dstActive ? 1 : 0;
 
             currentEpoch = mktime(&t);
             timeValid = true;
             lastTimeSync = millis();
 
-            Serial.printf("[⏰] Time synced: %s %s (UTC%+d)\n",
-                          dt, abbrev, rawOffset / 3600);
+            Serial.printf("[⏰] Time synced: %s (UTC%+d, DST=%s)\n",
+                          dt, utcOffset / 3600, dstActive ? "yes" : "no");
         } else {
             Serial.printf("[✗] Time JSON parse error: %s\n", err.c_str());
         }

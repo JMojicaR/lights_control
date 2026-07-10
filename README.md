@@ -82,7 +82,7 @@ GPIO 5 ──[10KΩ]──┬── IRLZ44N GATE
 
 | API | Endpoint | Purpose | Key Required? |
 |-----|----------|---------|---------------|
-| WorldTimeAPI | `worldtimeapi.org/api/timezone/{tz}` | Current time + timezone | No |
+| timeapi.io | `timeapi.io/api/v1/time/current/zone?timezone={tz}` | Current time + timezone | No |
 | sunrise-sunset.org | `api.sunrise-sunset.org/json` | Sunset/sunrise times | No |
 
 Both are free, no API key needed.
@@ -126,7 +126,7 @@ arduino-cli monitor -p /dev/ttyUSB0 -c baudrate=115200
 === Staircase Light Controller ===
 [✓] BH1750 ready
 [✓] WiFi connected — IP: 192.168.1.42
-[⏰] Time synced: 2026-06-26T14:30:00 CST (UTC-6)
+[⏰] Time synced: 2026-07-10T16:19:26-06:00 (UTC-6, DST=no)
 [🌅] Sunset: 2026-06-27T01:15:00 UTC  |  Sunrise: 2026-06-26T12:00:00 UTC
 [🌐] Dashboard: http://192.168.1.42/
 --- Ready ---

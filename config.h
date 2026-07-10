@@ -12,8 +12,8 @@
 #define TIMEZONE        "America/Mexico_City"
 
 // ── HTTP API Endpoints ──────────────────────────
-// WorldTimeAPI — returns current time in JSON
-#define TIME_API_URL    "http://worldtimeapi.org/api/timezone/"
+// timeapi.io — returns current time in JSON (free, no API key)
+#define TIME_API_URL    "https://timeapi.io/api/v1/time/current/zone?timezone="
 // sunrise-sunset.org — returns sunrise/sunset times (free, no API key)
 #define SUNSET_API_URL  "https://api.sunrise-sunset.org/json"
 
