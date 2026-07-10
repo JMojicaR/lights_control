@@ -1,6 +1,6 @@
 # Staircase Light Controller — ESP32-S3
 
-Automatically controls a 12V LED strip on a 5m staircase using motion, ambient light, and time-of-day logic.
+Automatically controls a 12V LED strip on a 5m staircase using motion, ambient light, and time-of-day logic. Includes a **web dashboard** for live monitoring and manual override.
 
 ## How It Works
 
@@ -17,6 +17,36 @@ Any condition false ────────────────▶ LIGHTS O
 2. **BH1750** measures ambient light (lux) — ensures lights don't fire during daytime
 3. **sunrise-sunset.org API** provides sunset time for your location — lights only at night
 4. Lights stay ON for 2 minutes after last motion, then turn OFF
+5. **Manual override** via web dashboard — force ON / OFF / AUTO
+
+## Web Dashboard
+
+Open `http://<esp32-ip>/` in any browser on the same network.
+
+| Feature | Description |
+|---------|-------------|
+| **Live status** | Lights ON/OFF, ambient lux, motion, local time, sunset |
+| **Manual override** | Force ON, Force OFF, or return to AUTO mode |
+| **Uptime & RSSI** | Device uptime and WiFi signal strength |
+| **JSON API** | `GET /api` returns machine-readable JSON |
+| **Override API** | `GET /api/override?mode=on\|off\|auto` for programmatic control |
+| **Auto-refresh** | Dashboard polls every 2 seconds |
+
+### API Examples
+
+```bash
+# Get current status
+curl http://192.168.1.42/api
+# → {"lights_on":true,"lux":3.5,"motion":true,"time":"14:30","sunset":"19:15","override":"auto","uptime":"2h 15m","rssi":-48,"ip":"192.168.1.42"}
+
+# Force lights on (e.g., from a script or home automation)
+curl "http://192.168.1.42/api/override?mode=on"
+# → {"override":"on","lights_on":true}
+
+# Return to automatic mode
+curl "http://192.168.1.42/api/override?mode=auto"
+# → {"override":"auto","lights_on":false}
+```
 
 ## Hardware
 
@@ -74,6 +104,10 @@ Edit `config.h` before flashing:
 ## Build & Flash
 
 ```bash
+# Install dependencies (first time only)
+arduino-cli lib install BH1750
+arduino-cli lib install ArduinoJson
+
 # Compile
 arduino-cli compile --fqbn esp32:esp32:esp32s3 .
 
@@ -84,6 +118,8 @@ arduino-cli upload -p /dev/ttyUSB0 --fqbn esp32:esp32:esp32s3 .
 arduino-cli monitor -p /dev/ttyUSB0 -c baudrate=115200
 ```
 
+**Flash usage:** ~1.1 MB (84%) of 1.28 MB program space, ~48 KB (14%) RAM. The web server (`WebServer.h`) is included with the ESP32 board package — no extra libraries needed.
+
 ## Serial Output
 
 ```
@@ -92,11 +128,15 @@ arduino-cli monitor -p /dev/ttyUSB0 -c baudrate=115200
 [✓] WiFi connected — IP: 192.168.1.42
 [⏰] Time synced: 2026-06-26T14:30:00 CST (UTC-6)
 [🌅] Sunset: 2026-06-27T01:15:00 UTC  |  Sunrise: 2026-06-26T12:00:00 UTC
+[🌐] Dashboard: http://192.168.1.42/
 --- Ready ---
-[STATUS] 14:30:15 | Lux: 450 | Motion: no | Lights: OFF | Sunset: 19:15
+[STATUS] 14:30:15 | Lux: 450 | Motion: no | Lights: OFF | Sunset: 19:15 | Mode: AUTO
 [👣] Motion detected!
 [💡] Decision: ON  (motion=1 dark=1 night=1 lux=3)
 [💡] Lights → ON
+[🕹] Override → FORCE OFF
+[💡] Lights → OFF (OVERRIDE)
+[🕹] Override → AUTO
 ```
 
 ## Dependencies (Arduino Libraries)
@@ -106,4 +146,4 @@ arduino-cli monitor -p /dev/ttyUSB0 -c baudrate=115200
 | BH1750 | ≥1.3.0 | `arduino-cli lib install BH1750` |
 | ArduinoJson | ≥7.0 | `arduino-cli lib install ArduinoJson` |
 
-WiFi, HTTPClient, and Wire are included with the ESP32 board package.
+WiFi, HTTPClient, Wire, and **WebServer** are included with the ESP32 board package.
