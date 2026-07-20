@@ -1,6 +1,6 @@
 # Staircase Light Controller — ESP32-S3
 
-Automatically controls a 12V LED strip on a 5m staircase using motion, ambient light, and time-of-day logic. Includes a **web dashboard** for live monitoring and manual override.
+Automatically controls a 12V LED strip on a 5m staircase and an AC light bulb via relay, using motion, ambient light, and time-of-day logic. Includes a **web dashboard** for live monitoring and manual override.
 
 ## How It Works
 
@@ -25,7 +25,7 @@ Open `http://<esp32-ip>/` in any browser on the same network.
 
 | Feature | Description |
 |---------|-------------|
-| **Live status** | Lights ON/OFF, ambient lux, motion, local time, sunset |
+| **Live status** | Lights ON/OFF, light bulb, ambient lux, motion, local time, sunset |
 | **Manual override** | Force ON, Force OFF, or return to AUTO mode |
 | **Uptime & RSSI** | Device uptime and WiFi signal strength |
 | **JSON API** | `GET /api` returns machine-readable JSON |
@@ -37,7 +37,7 @@ Open `http://<esp32-ip>/` in any browser on the same network.
 ```bash
 # Get current status
 curl http://192.168.1.42/api
-# → {"lights_on":true,"lux":3.5,"motion":true,"time":"14:30","sunset":"19:15","override":"auto","uptime":"2h 15m","rssi":-48,"ip":"192.168.1.42"}
+# → {"lights_on":true,"bulb_on":true,"lux":3.5,"motion":true,"time":"14:30","sunset":"19:15",...}
 
 # Force lights on (e.g., from a script or home automation)
 curl "http://192.168.1.42/api/override?mode=on"
@@ -56,7 +56,9 @@ curl "http://192.168.1.42/api/override?mode=auto"
 | HC-SR501 PIR | Motion detection | 4 (digital) |
 | BH1750 | Ambient light sensor | 21 (SDA), 22 (SCL) |
 | IRLZ44N MOSFET | Switch 12V LED strip | 5 (PWM-capable) |
+| Relay module (SRD-05VDC) | Switch AC light bulb | 7 (digital) |
 | 12V LED strip (5m) | Staircase lighting | MOSFET drain |
+| AC light bulb | Room lighting | Relay COM/NO |
 | 12V DC PSU (≥6A) | Power for LED strip | — |
 
 ### Wiring
@@ -76,6 +78,13 @@ GPIO 5 ──[10KΩ]──┬── IRLZ44N GATE
 
 12V PSU (+) ─── LED strip (+) ─── LED strip (-) ─── IRLZ44N DRAIN
 12V PSU (-) ─── IRLZ44N SOURCE ─── GND (common)
+
+Relay circuit:
+GPIO 7 ──────── Relay IN
+5V       ───── Relay VCC
+GND      ───── Relay GND
+Relay COM ──── AC Live (switched)
+Relay NO  ──── Light bulb ──── AC Neutral
 ```
 
 ## APIs Used
@@ -98,7 +107,7 @@ Edit `config.h` before flashing:
 #define LONGITUDE       -99.1332
 #define TIMEZONE        "America/Mexico_City"
 #define LUX_THRESHOLD   30         // Lux below this = "dark"
-#define LIGHT_DURATION_SEC  120    // Seconds to keep lights on after motion
+#define RELAY_ACTIVE_HIGH  true  // true = HIGH triggers relay, false = LOW triggers relay
 ```
 
 ## Build & Flash
@@ -130,7 +139,7 @@ arduino-cli monitor -p /dev/ttyUSB0 -c baudrate=115200
 [🌅] Sunset: 2026-06-27T01:15:00 UTC  |  Sunrise: 2026-06-26T12:00:00 UTC
 [🌐] Dashboard: http://192.168.1.42/
 --- Ready ---
-[STATUS] 14:30:15 | Lux: 450 | Motion: no | Lights: OFF | Sunset: 19:15 | Mode: AUTO
+[STATUS] 14:30:15 | Lux: 450 | Motion: no | LED: OFF | Bulb: OFF | Sunset: 19:15 | Mode: AUTO
 [👣] Motion detected!
 [💡] Decision: ON  (motion=1 dark=1 night=1 lux=3)
 [💡] Lights → ON

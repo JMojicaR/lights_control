@@ -23,6 +23,7 @@
  *   - HC-SR501 PIR motion sensor (GPIO 4)
  *   - BH1750 ambient light sensor (I²C: SDA 21, SCL 22)
  *   - IRLZ44N MOSFET switching 12V LED strip (GPIO 5)
+ *   - Relay module switching AC light bulb (GPIO 7)
  *   - 12V DC power supply (≥6A for 5m strip)
  */
 
@@ -56,6 +57,7 @@ unsigned long motionDebounceUntil = 0;
 
 // ── Light state ─────────────────────────────────
 bool     lightsOn        = false;
+bool     bulbOn          = false;
 unsigned long lightsOnSince  = 0;
 
 // ── Manual override ─────────────────────────────
@@ -81,8 +83,10 @@ void setup() {
     // Pins
     pinMode(PIR_PIN, INPUT);
     pinMode(LED_MOSFET_PIN, OUTPUT);
+    pinMode(RELAY_PIN, OUTPUT);
     pinMode(STATUS_LED_PIN, OUTPUT);
     digitalWrite(LED_MOSFET_PIN, LOW);
+    digitalWrite(RELAY_PIN, RELAY_ACTIVE_HIGH ? LOW : HIGH);
     digitalWrite(STATUS_LED_PIN, LOW);
 
     // I²C for BH1750
@@ -347,13 +351,17 @@ bool evaluate() {
 void setLights(bool on) {
     if (on && !lightsOn) {
         digitalWrite(LED_MOSFET_PIN, HIGH);
+        digitalWrite(RELAY_PIN, RELAY_ACTIVE_HIGH ? HIGH : LOW);
         lightsOn = true;
+        bulbOn = true;
         lightsOnSince = millis();
         const char* mode = (overrideMode == 1) ? " (OVERRIDE)" : "";
         Serial.printf("[💡] Lights → ON%s\n", mode);
     } else if (!on && lightsOn) {
         digitalWrite(LED_MOSFET_PIN, LOW);
+        digitalWrite(RELAY_PIN, RELAY_ACTIVE_HIGH ? LOW : HIGH);
         lightsOn = false;
+        bulbOn = false;
         const char* mode = (overrideMode == -1) ? " (OVERRIDE)" : "";
         Serial.printf("[💡] Lights → OFF%s\n", mode);
     }
@@ -389,10 +397,11 @@ void printStatus() {
     struct tm* sun = localtime(&sunsetEpoch);
     strftime(sunsetStr, sizeof(sunsetStr), "%H:%M", sun);
 
-    Serial.printf("[STATUS] %s | Lux: %.0f | Motion: %s | Lights: %s | Sunset: %s | Mode: %s\n",
+    Serial.printf("[STATUS] %s | Lux: %.0f | Motion: %s | LED: %s | Bulb: %s | Sunset: %s | Mode: %s\n",
                   timeStr, lux,
                   motionActive ? "YES" : "no",
                   lightsOn ? "ON" : "OFF",
+                  bulbOn ? "ON" : "OFF",
                   sunsetStr,
                   overrideMode == 1 ? "FORCE ON" : (overrideMode == -1 ? "FORCE OFF" : "AUTO"));
 }
@@ -429,6 +438,7 @@ void handleRoot() {
   .sunset .value{color:#fb923c}
   .time .value{color:#e2e8f0}
   .motion.active .value{color:#f87171}
+  .bulb-on .value{color:#fbbf24}
   .btn-row{display:flex;gap:8px;margin-top:4px}
   .btn{flex:1;background:#1e293b;border:1px solid #334155;border-radius:10px;padding:12px 8px;color:#cbd5e1;font-size:.85rem;font-weight:600;cursor:pointer;transition:all .15s}
   .btn:hover{background:#334155}
@@ -458,6 +468,10 @@ void handleRoot() {
     <div class="tile motion" id="motionTile">
       <div class="label">👣 Motion</div>
       <div class="value" id="motion">--</div>
+    </div>
+    <div class="tile" id="bulbTile">
+      <div class="label">💡 Light Bulb</div>
+      <div class="value" id="bulb">--</div>
     </div>
     <div class="tile time">
       <div class="label">🕐 Local Time</div>
@@ -516,6 +530,17 @@ async function fetchData() {
     } else {
       mTile.className = 'tile motion';
       mMetric.textContent = 'Idle';
+    }
+
+    // Bulb
+    const bTile = document.getElementById('bulbTile');
+    const bMetric = document.getElementById('bulb');
+    if (d.bulb_on) {
+      bTile.className = 'tile bulb-on';
+      bMetric.textContent = 'ON';
+    } else {
+      bTile.className = 'tile';
+      bMetric.textContent = 'OFF';
     }
 
     // Time
@@ -598,6 +623,7 @@ void handleAPI() {
 
     String json = "{";
     json += "\"lights_on\":" + String(lightsOn ? "true" : "false") + ",";
+    json += "\"bulb_on\":" + String(bulbOn ? "true" : "false") + ",";
     json += "\"lux\":" + String(lux, 1) + ",";
     json += "\"motion\":" + String(motionActive ? "true" : "false") + ",";
     json += "\"time\":\"" + String(timeStr) + "\",";

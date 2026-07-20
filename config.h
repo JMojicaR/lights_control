@@ -20,6 +20,7 @@
 // ── Pins ────────────────────────────────────────
 #define PIR_PIN         4       // HC-SR501 motion sensor (digital)
 #define LED_MOSFET_PIN  5       // IRLZ44N gate for 12V LED strip
+#define RELAY_PIN       7       // Relay module for AC light bulb (digital)
 #define STATUS_LED_PIN  2       // Built-in LED (2 = most ESP32-S3 SuperMini)
 
 // BH1750 uses I²C (default pins on ESP32-S3 SuperMini)
@@ -31,6 +32,7 @@
 #define LIGHT_DURATION_SEC  120   // Keep lights ON this many seconds after last motion
 #define MOTION_DEBOUNCE_MS  2000  // Ignore motion re-triggers within this window
 #define PIR_RETRIGGER       false // HC-SR501: false = single trigger, true = repeat
+#define RELAY_ACTIVE_HIGH   true  // true = HIGH closes relay, false = LOW closes relay
 
 // ── Timing ──────────────────────────────────────
 #define SENSOR_POLL_MS      250   // How often to read sensors (milliseconds)
