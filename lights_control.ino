@@ -20,7 +20,8 @@
  *
  * Hardware:
  *   - ESP32-S3 SuperMini
- *   - HC-SR501 PIR motion sensor (GPIO 4)
+ *   - HC-SR501 PIR motion sensor — bottom of stairs (GPIO 4)
+ *   - HC-SR501 PIR motion sensor — top of stairs (GPIO 6)
  *   - BH1750 ambient light sensor (I²C: SDA 21, SCL 22)
  *   - IRLZ44N MOSFET switching 12V LED strip (GPIO 5)
  *   - 12V DC power supply (≥6A for 5m strip)
@@ -50,7 +51,8 @@ const unsigned long TIME_RESYNC_MS   = TIME_RESYNC_MIN  * 60000UL;
 const unsigned long SUNSET_RESYNC_MS = SUNSET_RESYNC_MIN * 60000UL;
 
 // ── Motion tracking ─────────────────────────────
-bool     motionActive    = false;
+bool     motionActiveBottom = false;
+bool     motionActiveTop    = false;
 unsigned long lastMotionTime = 0;
 unsigned long motionDebounceUntil = 0;
 
@@ -87,7 +89,8 @@ void setup() {
     Serial.println("\n=== Staircase Light Controller ===\n");
 
     // Pins — LED MOSFET uses PWM for fade
-    pinMode(PIR_PIN, INPUT);
+    pinMode(PIR_PIN_BOTTOM, INPUT);
+    pinMode(PIR_PIN_TOP, INPUT);
     pinMode(STATUS_LED_PIN, OUTPUT);
     digitalWrite(STATUS_LED_PIN, LOW);
 
@@ -285,24 +288,37 @@ void syncSunset() {
 // Sensors
 // ═════════════════════════════════════════════════
 void readSensors() {
-    // PIR motion
-    int pir = digitalRead(PIR_PIN);
     unsigned long now = millis();
 
-    if (pir == HIGH && now >= motionDebounceUntil) {
-        // Rising edge — motion detected
-        if (!motionActive) {
-            Serial.println("[👣] Motion detected!");
+    // PIR — bottom of stairs
+    int pirBottom = digitalRead(PIR_PIN_BOTTOM);
+    if (pirBottom == HIGH && now >= motionDebounceUntil) {
+        if (!motionActiveBottom) {
+            Serial.println("[👣] Motion detected — bottom!");
         }
-        motionActive = true;
+        motionActiveBottom = true;
         lastMotionTime = now;
         motionDebounceUntil = now + MOTION_DEBOUNCE_MS;
     }
 
-    // Motion timeout
-    if (motionActive && (now - lastMotionTime > lightDurationSec * 1000UL)) {
-        motionActive = false;
-        Serial.println("[👣] Motion timeout — no movement");
+    // PIR — top of stairs
+    int pirTop = digitalRead(PIR_PIN_TOP);
+    if (pirTop == HIGH && now >= motionDebounceUntil) {
+        if (!motionActiveTop) {
+            Serial.println("[👣] Motion detected — top!");
+        }
+        motionActiveTop = true;
+        lastMotionTime = now;
+        motionDebounceUntil = now + MOTION_DEBOUNCE_MS;
+    }
+
+    // Motion timeout: clear both PIR states when no motion for duration
+    bool anyMotion = (motionActiveBottom || motionActiveTop);
+    if (anyMotion && (now - lastMotionTime > lightDurationSec * 1000UL)) {
+        if (motionActiveBottom) Serial.println("[👣] Motion timeout — bottom");
+        if (motionActiveTop)    Serial.println("[👣] Motion timeout — top");
+        motionActiveBottom = false;
+        motionActiveTop    = false;
     }
 
     // BH1750 — ambient light (lux)
@@ -337,8 +353,8 @@ bool evaluate() {
     // Between sunrise and sunset = daytime → no lights needed
     bool isNight = (nowEpoch >= sunsetEpoch || nowEpoch < sunriseEpoch);
 
-    // Condition 3: Was motion recently detected?
-    bool hasMotion = motionActive;
+    // Condition 3: Was motion recently detected by either PIR?
+    bool hasMotion = (motionActiveBottom || motionActiveTop);
 
     // Decision table:
     //   motion + dark + night → ON
@@ -432,13 +448,14 @@ void printStatus() {
     struct tm* sun = localtime(&sunsetEpoch);
     strftime(sunsetStr, sizeof(sunsetStr), "%H:%M", sun);
 
-    Serial.printf("[STATUS] %s | Lux: %.0f | Motion: %s | Lights: %s", 
+    Serial.printf("[STATUS] %s | Lux: %.0f | Motion bottom: %s | Motion top: %s | Lights: %s", 
                   timeStr, lux,
-                  motionActive ? "YES" : "no",
+                  motionActiveBottom ? "YES" : "no",
+                  motionActiveTop ? "YES" : "no",
                   currentDuty > 0 ? "ON" : "OFF");
 
     // Remaining time when lights are on
-    if (currentDuty > 0 && motionActive) {
+    if (currentDuty > 0 && (motionActiveBottom || motionActiveTop)) {
         unsigned long remaining = lightDurationSec - ((millis() - lastMotionTime) / 1000);
         Serial.printf(" | Remaining: %lus", remaining);
     }
@@ -515,9 +532,13 @@ void handleRoot() {
       <div class="label">☀️ Ambient Light</div>
       <div class="value" id="lux">--</div>
     </div>
-    <div class="tile motion" id="motionTile">
-      <div class="label">👣 Motion</div>
-      <div class="value" id="motion">--</div>
+    <div class="tile motion" id="motionTileB">
+      <div class="label">👣 Motion Bottom</div>
+      <div class="value" id="motionB">--</div>
+    </div>
+    <div class="tile motion" id="motionTileT">
+      <div class="label">👣 Motion Top</div>
+      <div class="value" id="motionT">--</div>
     </div>
     <div class="tile time">
       <div class="label">🕐 Local Time</div>
@@ -577,15 +598,26 @@ async function fetchData() {
     // Lux
     document.getElementById('lux').innerHTML = d.lux.toFixed(0) + ' <small style="font-size:.65rem;opacity:.6">lux</small>';
 
-    // Motion
-    const mTile = document.getElementById('motionTile');
-    const mMetric = document.getElementById('motion');
-    if (d.motion) {
-      mTile.className = 'tile motion active';
-      mMetric.textContent = 'Active';
+    // Motion — bottom
+    const mTileB = document.getElementById('motionTileB');
+    const mMetricB = document.getElementById('motionB');
+    if (d.motion_bottom) {
+      mTileB.className = 'tile motion active';
+      mMetricB.textContent = 'Active';
     } else {
-      mTile.className = 'tile motion';
-      mMetric.textContent = 'Idle';
+      mTileB.className = 'tile motion';
+      mMetricB.textContent = 'Idle';
+    }
+
+    // Motion — top
+    const mTileT = document.getElementById('motionTileT');
+    const mMetricT = document.getElementById('motionT');
+    if (d.motion_top) {
+      mTileT.className = 'tile motion active';
+      mMetricT.textContent = 'Active';
+    } else {
+      mTileT.className = 'tile motion';
+      mMetricT.textContent = 'Idle';
     }
 
     // Time
@@ -698,7 +730,7 @@ void handleAPI() {
 
     // Compute remaining time (seconds) when lights are on
     long remainingSec = 0;
-    if (currentDuty > 0 && motionActive) {
+    if (currentDuty > 0 && (motionActiveBottom || motionActiveTop)) {
         long elapsed = (millis() - lastMotionTime) / 1000;
         remainingSec = (long)lightDurationSec - elapsed;
         if (remainingSec < 0) remainingSec = 0;
@@ -712,7 +744,8 @@ void handleAPI() {
     json += "\"lights_on\":" + String(currentDuty > 0 ? "true" : "false") + ",";
     json += "\"duty\":" + String(currentDuty) + ",";
     json += "\"lux\":" + String(lux, 1) + ",";
-    json += "\"motion\":" + String(motionActive ? "true" : "false") + ",";
+    json += "\"motion_bottom\":" + String(motionActiveBottom ? "true" : "false") + ",";
+    json += "\"motion_top\":" + String(motionActiveTop ? "true" : "false") + ",";
     json += "\"time\":\"" + String(timeStr) + "\",";
     json += "\"sunset\":\"" + String(sunsetStr) + "\",";
     json += "\"override\":\"" + String(overrideStr) + "\",";

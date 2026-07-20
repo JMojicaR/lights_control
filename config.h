@@ -18,9 +18,10 @@
 #define SUNSET_API_URL  "https://api.sunrise-sunset.org/json"
 
 // ── Pins ────────────────────────────────────────
-#define PIR_PIN         4       // HC-SR501 motion sensor (digital)
-#define LED_MOSFET_PIN  5       // IRLZ44N gate for 12V LED strip
-#define STATUS_LED_PIN  2       // Built-in LED (2 = most ESP32-S3 SuperMini)
+#define PIR_PIN_BOTTOM   4       // HC-SR501 PIR at bottom of stairs (digital)
+#define PIR_PIN_TOP      6       // HC-SR501 PIR at top of stairs (digital)
+#define LED_MOSFET_PIN   5       // IRLZ44N gate for 12V LED strip
+#define STATUS_LED_PIN   2       // Built-in LED (2 = most ESP32-S3 SuperMini)
 
 // BH1750 uses I²C (default pins on ESP32-S3 SuperMini)
 #define I2C_SDA         21
