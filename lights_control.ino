@@ -35,10 +35,15 @@
 #include <ArduinoJson.h>
 #include <WebServer.h>
 #include <time.h>
+#include <Preferences.h>
 
 // ── Objects ─────────────────────────────────────
 BH1750 lightMeter;
 WebServer server(80);
+Preferences prefs;
+
+const char* PREF_NAMESPACE = "stairs";
+const char* PREF_KEY_DURATION = "dur_sec";
 
 // ── Time tracking ───────────────────────────────
 unsigned long lastTimeSync   = 0;      // millis() of last HTTP time sync
@@ -68,7 +73,8 @@ int      targetDuty      = 0;     // Desired PWM duty cycle
 unsigned long fadeStartMs = 0;    // When the current fade began
 
 // ── Dynamic light duration (changeable via HTTP) ─
-unsigned long lightDurationSec = DEFAULT_LIGHT_DURATION_SEC;
+unsigned long configuredDurationSec = DEFAULT_LIGHT_DURATION_SEC; // Used for new sessions
+unsigned long activeDurationSec     = DEFAULT_LIGHT_DURATION_SEC; // Locked for current session
 
 // ── Manual override ─────────────────────────────
 //  0 = AUTO (use sensor/sunset logic)
@@ -89,6 +95,26 @@ void setup() {
     Serial.begin(115200);
     delay(250);
     Serial.println("\n=== Staircase Light Controller ===\n");
+
+    // Load persisted configured duration (fallback to compile-time default).
+    if (prefs.begin(PREF_NAMESPACE, true)) {
+      unsigned long saved = prefs.getULong(PREF_KEY_DURATION, DEFAULT_LIGHT_DURATION_SEC);
+      prefs.end();
+
+      if (saved >= DURATION_MIN_SEC && saved <= DURATION_MAX_SEC) {
+        configuredDurationSec = saved;
+      } else {
+        configuredDurationSec = DEFAULT_LIGHT_DURATION_SEC;
+        Serial.printf("[⚠] Stored duration invalid (%lu) — using default %lu\n",
+                saved, configuredDurationSec);
+      }
+    } else {
+      configuredDurationSec = DEFAULT_LIGHT_DURATION_SEC;
+      Serial.printf("[⚠] Preferences unavailable — using default duration %lu\n",
+              configuredDurationSec);
+    }
+    activeDurationSec = configuredDurationSec;
+    Serial.printf("[⚙] Configured duration loaded: %lus\n", configuredDurationSec);
 
     // Pins — LED MOSFET uses PWM for fade
     pinMode(PIR_PIN_BOTTOM, INPUT);
@@ -360,6 +386,7 @@ void syncSunset() {
 // ═════════════════════════════════════════════════
 void readSensors() {
     unsigned long now = millis();
+  bool sessionWasActive = (motionActiveBottom || motionActiveTop);
 
     // PIR — bottom of stairs
     int pirBottom = digitalRead(PIR_PIN_BOTTOM);
@@ -383,9 +410,16 @@ void readSensors() {
         motionDebounceUntil = now + MOTION_DEBOUNCE_MS;
     }
 
+    // Start a new motion session only when transitioning from idle -> active.
+    bool sessionNowActive = (motionActiveBottom || motionActiveTop);
+    if (!sessionWasActive && sessionNowActive) {
+      activeDurationSec = configuredDurationSec;
+      Serial.printf("[⏱] New motion session — duration locked at %lus\n", activeDurationSec);
+    }
+
     // Motion timeout: clear both PIR states when no motion for duration
     bool anyMotion = (motionActiveBottom || motionActiveTop);
-    if (anyMotion && (now - lastMotionTime > lightDurationSec * 1000UL)) {
+    if (anyMotion && (now - lastMotionTime > activeDurationSec * 1000UL)) {
         if (motionActiveBottom) Serial.println("[👣] Motion timeout — bottom");
         if (motionActiveTop)    Serial.println("[👣] Motion timeout — top");
         motionActiveBottom = false;
@@ -511,14 +545,15 @@ void printStatus() {
 
     // Remaining time when lights are on
     if (currentDuty > 0 && (motionActiveBottom || motionActiveTop)) {
-        unsigned long remaining = lightDurationSec - ((millis() - lastMotionTime) / 1000);
+        unsigned long remaining = activeDurationSec - ((millis() - lastMotionTime) / 1000);
         Serial.printf(" | Remaining: %lus", remaining);
     }
 
-    Serial.printf(" | Sunset: %s | Mode: %s | Duration: %lus\n",
+      Serial.printf(" | Sunset: %s | Mode: %s | Duration(set): %lus | Duration(active): %lus\n",
                   sunsetStr,
                   overrideMode == 1 ? "FORCE ON" : (overrideMode == -1 ? "FORCE OFF" : "AUTO"),
-                  lightDurationSec);
+              configuredDurationSec,
+              activeDurationSec);
 }
 
 // ═════════════════════════════════════════════════
@@ -631,6 +666,11 @@ const ip = window.location.host;
 document.getElementById('ip').textContent = 'http://' + ip + '/';
 
 let currentOverride = 'auto';
+let durationEditing = false;
+
+const durInputEl = document.getElementById('durInput');
+durInputEl.addEventListener('focus', () => { durationEditing = true; });
+durInputEl.addEventListener('blur', () => { durationEditing = false; });
 
 async function fetchData() {
   try {
@@ -701,8 +741,10 @@ async function fetchData() {
       remTile.className = 'tile remaining';
     }
 
-    // Duration (sync input from API)
-    document.getElementById('durInput').value = d.duration_sec;
+    // Duration: do not overwrite user draft while editing.
+    if (!durationEditing) {
+      document.getElementById('durInput').value = d.duration_sec;
+    }
 
     // Uptime
     document.getElementById('uptime').textContent = 'Uptime ' + d.uptime;
@@ -785,7 +827,7 @@ void handleAPI() {
     long remainingSec = 0;
     if (currentDuty > 0 && (motionActiveBottom || motionActiveTop)) {
         long elapsed = (millis() - lastMotionTime) / 1000;
-        remainingSec = (long)lightDurationSec - elapsed;
+      remainingSec = (long)activeDurationSec - elapsed;
         if (remainingSec < 0) remainingSec = 0;
     }
 
@@ -805,7 +847,8 @@ void handleAPI() {
     json += "\"uptime\":\"" + String(uptimeStr) + "\",";
     json += "\"rssi\":" + String(WiFi.RSSI()) + ",";
     json += "\"ip\":\"" + WiFi.localIP().toString() + "\",";
-    json += "\"duration_sec\":" + String(lightDurationSec) + ",";
+    json += "\"duration_sec\":" + String(configuredDurationSec) + ",";
+    json += "\"active_duration_sec\":" + String(activeDurationSec) + ",";
     json += "\"remaining_sec\":" + String(remainingSec);
     json += "}";
 
@@ -869,18 +912,29 @@ void handleDuration() {
             return;
         }
 
-        lightDurationSec = (unsigned long)newDuration;
-        Serial.printf("[⚙] Duration set to %lus (HTTP)\\n", lightDurationSec);
+        configuredDurationSec = (unsigned long)newDuration;
+        Serial.printf("[⚙] Duration set to %lus (HTTP, applies to next session)\\n", configuredDurationSec);
 
-        char resp[128];
+        bool persisted = false;
+        if (prefs.begin(PREF_NAMESPACE, false)) {
+          persisted = (prefs.putULong(PREF_KEY_DURATION, configuredDurationSec) > 0);
+          prefs.end();
+        }
+        if (!persisted) {
+          Serial.println("[⚠] Failed to persist duration to NVS");
+        }
+
+        char resp[192];
         snprintf(resp, sizeof(resp),
-                 "{\"duration_sec\":%lu,\"ok\":true}", lightDurationSec);
+           "{\"duration_sec\":%lu,\"active_duration_sec\":%lu,\"persisted\":%s,\"ok\":true}",
+           configuredDurationSec, activeDurationSec, persisted ? "true" : "false");
         server.send(200, "application/json", resp);
     } else {
         // GET — return current duration
-        char resp[128];
+        char resp[192];
         snprintf(resp, sizeof(resp),
-                 "{\"duration_sec\":%lu}", lightDurationSec);
+             "{\"duration_sec\":%lu,\"active_duration_sec\":%lu}",
+             configuredDurationSec, activeDurationSec);
         server.send(200, "application/json", resp);
     }
 }
