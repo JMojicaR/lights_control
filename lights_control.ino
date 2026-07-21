@@ -34,6 +34,7 @@
 #include <BH1750.h>
 #include <ArduinoJson.h>
 #include <WebServer.h>
+#include <time.h>
 
 // ── Objects ─────────────────────────────────────
 BH1750 lightMeter;
@@ -47,6 +48,7 @@ time_t        sunsetEpoch    = 0;      // today's sunset Unix time
 time_t        sunriseEpoch   = 0;      // today's sunrise Unix time
 bool          timeValid      = false;
 bool          sunsetValid    = false;
+int           localUtcOffsetSec = -6 * 3600; // Updated from time API (Mexico City offset)
 const unsigned long TIME_RESYNC_MS   = TIME_RESYNC_MIN  * 60000UL;
 const unsigned long SUNSET_RESYNC_MS = SUNSET_RESYNC_MIN * 60000UL;
 
@@ -191,6 +193,73 @@ void connectWiFi() {
 }
 
 // ═════════════════════════════════════════════════
+// Time Helpers (UTC-safe)
+// ═════════════════════════════════════════════════
+
+long daysFromCivil(int y, unsigned m, unsigned d) {
+  y -= m <= 2;
+  const int era = (y >= 0 ? y : y - 399) / 400;
+  const unsigned yoe = (unsigned)(y - era * 400);
+  const unsigned doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+  const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+  return era * 146097L + (long)doe - 719468L;
+}
+
+time_t buildUtcEpoch(int year, int month, int day, int hour, int minute, int second) {
+  long days = daysFromCivil(year, (unsigned)month, (unsigned)day);
+  long long secs = (long long)days * 86400LL +
+           (long long)hour * 3600LL +
+           (long long)minute * 60LL +
+           (long long)second;
+  return (time_t)secs;
+}
+
+int parseIsoOffsetSeconds(const String& iso) {
+  int n = iso.length();
+  if (n >= 1 && iso.charAt(n - 1) == 'Z') {
+    return 0;
+  }
+  if (n >= 6 && (iso.charAt(n - 6) == '+' || iso.charAt(n - 6) == '-') && iso.charAt(n - 3) == ':') {
+    int sign = (iso.charAt(n - 6) == '-') ? -1 : 1;
+    int offH = atoi(iso.substring(n - 5, n - 3).c_str());
+    int offM = atoi(iso.substring(n - 2, n).c_str());
+    return sign * ((offH * 3600) + (offM * 60));
+  }
+  return 0;
+}
+
+time_t isoToEpoch(const char* iso) {
+  String s = String(iso);
+  if (s.length() < 19) return 0;
+
+  int year   = atoi(s.substring(0, 4).c_str());
+  int month  = atoi(s.substring(5, 7).c_str());
+  int day    = atoi(s.substring(8, 10).c_str());
+  int hour   = atoi(s.substring(11, 13).c_str());
+  int minute = atoi(s.substring(14, 16).c_str());
+  int second = atoi(s.substring(17, 19).c_str());
+  int offsetSec = parseIsoOffsetSeconds(s);
+
+  // ISO timestamp encodes local wall time + offset. Convert to UTC epoch.
+  time_t wallEpoch = buildUtcEpoch(year, month, day, hour, minute, second);
+  return wallEpoch - offsetSec;
+}
+
+void formatHHMMFromEpoch(time_t epochUtc, int utcOffsetSec, char* out, size_t outSize) {
+  time_t localEpoch = epochUtc + utcOffsetSec;
+  struct tm tmUtc = {};
+  gmtime_r(&localEpoch, &tmUtc);
+  strftime(out, outSize, "%H:%M", &tmUtc);
+}
+
+void formatHHMMSSFromEpoch(time_t epochUtc, int utcOffsetSec, char* out, size_t outSize) {
+  time_t localEpoch = epochUtc + utcOffsetSec;
+  struct tm tmUtc = {};
+  gmtime_r(&localEpoch, &tmUtc);
+  strftime(out, outSize, "%H:%M:%S", &tmUtc);
+}
+
+// ═════════════════════════════════════════════════
 // HTTP: Sync current time from timeapi.io
 // ═════════════════════════════════════════════════
 void syncTime() {
@@ -213,25 +282,24 @@ void syncTime() {
         if (!err) {
             const char* dt = doc["date_time"];       // "2026-07-10T16:19:26.627199-06:00"
             int utcOffset = doc["utc_offset_seconds"];// seconds offset from UTC
-            bool dstActive = doc["dst_active"];       // true if DST is in effect
+          bool dstActive = doc["dst_active"];
 
-            // Parse ISO datetime to epoch (simple approach: extract and use mktime)
-            // Format: "2026-07-10T16:19:26.627199-06:00"
-            struct tm t = {};
-            t.tm_year = atoi(String(dt).substring(0, 4).c_str()) - 1900;
-            t.tm_mon  = atoi(String(dt).substring(5, 7).c_str()) - 1;
-            t.tm_mday = atoi(String(dt).substring(8, 10).c_str());
-            t.tm_hour = atoi(String(dt).substring(11, 13).c_str());
-            t.tm_min  = atoi(String(dt).substring(14, 16).c_str());
-            t.tm_sec  = atoi(String(dt).substring(17, 19).c_str());
-            t.tm_isdst = dstActive ? 1 : 0;
+          time_t parsedEpoch = isoToEpoch(dt);
+          if (parsedEpoch == 0) {
+            Serial.println("[✗] Time parse error");
+            http.end();
+            return;
+          }
 
-            currentEpoch = mktime(&t);
+          currentEpoch = parsedEpoch;
+          localUtcOffsetSec = utcOffset;
             timeValid = true;
             lastTimeSync = millis();
 
-            Serial.printf("[⏰] Time synced: %s (UTC%+d, DST=%s)\n",
-                          dt, utcOffset / 3600, dstActive ? "yes" : "no");
+          char localNow[16];
+          formatHHMMSSFromEpoch(currentEpoch, localUtcOffsetSec, localNow, sizeof(localNow));
+          Serial.printf("[⏰] Time synced: %s | Local: %s | UTC offset: %+d h (DST=%s)\n",
+                  dt, localNow, utcOffset / 3600, dstActive ? "yes" : "no");
         } else {
             Serial.printf("[✗] Time JSON parse error: %s\n", err.c_str());
         }
@@ -273,8 +341,11 @@ void syncSunset() {
             sunsetValid  = true;
             lastSunsetSync = millis();
 
-            Serial.printf("[🌅] Sunset: %s UTC  |  Sunrise: %s UTC\n",
-                          sunsetStr, sunriseStr);
+          char sunsetLocal[8];
+          formatHHMMFromEpoch(sunsetEpoch, localUtcOffsetSec, sunsetLocal, sizeof(sunsetLocal));
+
+          Serial.printf("[🌅] Sunset API(UTC): %s | Sunset local(MX): %s | Sunrise API(UTC): %s\n",
+                  sunsetStr, sunsetLocal, sunriseStr);
         } else {
             Serial.printf("[✗] Sunset JSON error: %s\n", err.c_str());
         }
@@ -422,31 +493,15 @@ void updateFade() {
 // Helpers
 // ═════════════════════════════════════════════════
 
-// Convert ISO 8601 string to Unix epoch
-// Input: "2026-06-27T01:15:00+00:00"
-time_t isoToEpoch(const char* iso) {
-    struct tm t = {};
-    t.tm_year = atoi(String(iso).substring(0, 4).c_str()) - 1900;
-    t.tm_mon  = atoi(String(iso).substring(5, 7).c_str()) - 1;
-    t.tm_mday = atoi(String(iso).substring(8, 10).c_str());
-    t.tm_hour = atoi(String(iso).substring(11, 13).c_str());
-    t.tm_min  = atoi(String(iso).substring(14, 16).c_str());
-    t.tm_sec  = atoi(String(iso).substring(17, 19).c_str());
-    t.tm_isdst = 0;
-    return mktime(&t);
-}
-
 // Print status report
 void printStatus() {
     time_t now = currentEpoch + ((millis() - lastTimeSync) / 1000);
-    struct tm* local = localtime(&now);
 
     char timeStr[16];
-    strftime(timeStr, sizeof(timeStr), "%H:%M:%S", local);
+  formatHHMMSSFromEpoch(now, localUtcOffsetSec, timeStr, sizeof(timeStr));
 
     char sunsetStr[16];
-    struct tm* sun = localtime(&sunsetEpoch);
-    strftime(sunsetStr, sizeof(sunsetStr), "%H:%M", sun);
+  formatHHMMFromEpoch(sunsetEpoch, localUtcOffsetSec, sunsetStr, sizeof(sunsetStr));
 
     Serial.printf("[STATUS] %s | Lux: %.0f | Motion bottom: %s | Motion top: %s | Lights: %s", 
                   timeStr, lux,
@@ -705,14 +760,12 @@ setInterval(fetchData, 2000);
 // ═════════════════════════════════════════════════
 void handleAPI() {
     time_t now = currentEpoch + ((millis() - lastTimeSync) / 1000);
-    struct tm* local = localtime(&now);
 
     char timeStr[8];  // "HH:MM" or "HH:MM:SS"
-    strftime(timeStr, sizeof(timeStr), "%H:%M", local);
+  formatHHMMFromEpoch(now, localUtcOffsetSec, timeStr, sizeof(timeStr));
 
     char sunsetStr[8];
-    struct tm* sun = localtime(&sunsetEpoch);
-    strftime(sunsetStr, sizeof(sunsetStr), "%H:%M", sun);
+  formatHHMMFromEpoch(sunsetEpoch, localUtcOffsetSec, sunsetStr, sizeof(sunsetStr));
 
     // Uptime as human-readable string
     unsigned long uptimeSec = (millis() - bootMillis) / 1000;

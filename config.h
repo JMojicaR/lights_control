@@ -2,8 +2,8 @@
 #define CONFIG_H
 
 // ── WiFi ────────────────────────────────────────
-#define WIFI_SSID       "YOUR_SSID"
-#define WIFI_PASSWORD   "YOUR_PASSWORD"
+#define WIFI_SSID       "SSID"
+#define WIFI_PASSWORD   "PASSWORD"
 
 // ── Location & Timezone ─────────────────────────
 // Used for the sunset API (sunrise-sunset.org)
@@ -24,12 +24,12 @@
 #define STATUS_LED_PIN   2       // Built-in LED (2 = most ESP32-S3 SuperMini)
 
 // BH1750 uses I²C (default pins on ESP32-S3 SuperMini)
-#define I2C_SDA         21
-#define I2C_SCL         22
+#define I2C_SDA         12
+#define I2C_SCL         13
 
 // ── Light & Motion Thresholds ───────────────────
 #define LUX_THRESHOLD       30    // Lux below this = "dark enough" for lights
-#define DEFAULT_LIGHT_DURATION_SEC  120  // Keep lights ON this many seconds after last motion (default, changeable via HTTP)
+#define DEFAULT_LIGHT_DURATION_SEC  90  // Keep lights ON this many seconds after last motion (default, changeable via HTTP)
 #define MOTION_DEBOUNCE_MS          2000  // Ignore motion re-triggers within this window
 #define PIR_RETRIGGER       false // HC-SR501: false = single trigger, true = repeat
 
