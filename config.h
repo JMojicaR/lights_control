@@ -18,12 +18,12 @@
 #define SUNSET_API_URL  "https://api.sunrise-sunset.org/json"
 
 // ── Pins ────────────────────────────────────────
-#define PIR_PIN_BOTTOM   4       // HC-SR501 PIR at bottom of stairs (digital)
-#define PIR_PIN_TOP      6       // HC-SR501 PIR at top of stairs (digital)
-#define LED_MOSFET_PIN   5       // IRLZ44N gate for 12V LED strip
-#define STATUS_LED_PIN   2       // Built-in LED (2 = most ESP32-S3 SuperMini)
+#define VL53L0X_XSHUT_BOTTOM  4   // VL53L0X ToF sensor at bottom of stairs (XSHUT pin)
+#define VL53L0X_XSHUT_TOP     6   // VL53L0X ToF sensor at top of stairs (XSHUT pin)
+#define LED_MOSFET_PIN        5   // IRLZ44N gate for 12V LED strip
+#define STATUS_LED_PIN        2   // Built-in LED (2 = most ESP32-S3 SuperMini)
 
-// BH1750 uses I²C (default pins on ESP32-S3 SuperMini)
+// BH1750 + VL53L0X share I²C (default pins on ESP32-S3 SuperMini)
 #define I2C_SDA         12
 #define I2C_SCL         13
 
@@ -31,7 +31,15 @@
 #define LUX_THRESHOLD       30    // Lux below this = "dark enough" for lights
 #define DEFAULT_LIGHT_DURATION_SEC  90  // Keep lights ON this many seconds after last motion (default, changeable via HTTP)
 #define MOTION_DEBOUNCE_MS          2000  // Ignore motion re-triggers within this window
-#define PIR_RETRIGGER       false // HC-SR501: false = single trigger, true = repeat
+
+// ── VL53L0X ToF Sensor Settings ──────────────────
+// VL53L0X I²C addresses (when using two sensors on same bus)
+#define VL53L0X_ADDR_DEFAULT  0x29  // Default I²C address (sensor 0 — bottom)
+#define VL53L0X_ADDR_ALT      0x30  // Alternate address for second sensor (top)
+// Presence detection: distance below this = person detected (mm)
+#define VL53L0X_PRESENCE_MM   1200  // 1.2m — someone is on/near the stairs
+// Range status: 0=valid, other=out-of-range or error
+#define VL53L0X_TIMING_BUDGET_MS  33  // 33ms = standard speed (~1.2m range)
 
 // ── Timing ──────────────────────────────────────
 #define SENSOR_POLL_MS      250   // How often to read sensors (milliseconds)

@@ -16,3 +16,4 @@ Thumbs.db
 
 # Dependencies (don't commit library source)
 libraries/
+__pycache__/
