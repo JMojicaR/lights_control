@@ -13,19 +13,20 @@ Any condition false ────────────────▶ LIGHTS O
 ```
 
 **Decision logic:**
-1. **HC-SR501 PIR** detects motion on the stairs
-2. **BH1750** measures ambient light (lux) — ensures lights don't fire during daytime
-3. **sunrise-sunset.org API** provides sunset time for your location — lights only at night
-4. Lights stay ON for 2 minutes after last motion, then turn OFF
-5. **Manual override** via web dashboard — force ON / OFF / AUTO
+1. **HC-SR501 PIR** (bottom of stairs) detects motion at the bottom
+2. **HC-SR501 PIR** (top of stairs) detects motion at the top
+3. **BH1750** measures ambient light (lux) — ensures lights don't fire during daytime
+4. **sunrise-sunset.org API** provides sunset time for your location — lights only at night
+5. Lights stay ON for 2 minutes after last motion (from either sensor), then turn OFF
+6. **Manual override** via web dashboard — force ON / OFF / AUTO
 
 ## Web Dashboard
 
 Open `http://<esp32-ip>/` in any browser on the same network.
 
-| Feature | Description |
+| Tile | Description |
 |---------|-------------|
-| **Live status** | Lights ON/OFF, ambient lux, motion, local time, sunset |
+| **Live status** | Lights ON/OFF, ambient lux, motion (bottom/top), local time, sunset |
 | **Manual override** | Force ON, Force OFF, or return to AUTO mode |
 | **Uptime & RSSI** | Device uptime and WiFi signal strength |
 | **JSON API** | `GET /api` returns machine-readable JSON |
@@ -37,7 +38,7 @@ Open `http://<esp32-ip>/` in any browser on the same network.
 ```bash
 # Get current status
 curl http://192.168.1.42/api
-# → {"lights_on":true,"lux":3.5,"motion":true,"time":"14:30","sunset":"19:15","override":"auto","uptime":"2h 15m","rssi":-48,"ip":"192.168.1.42"}
+# → {"lights_on":false,"duty":0,"lux":3.5,"motion_bottom":true,"motion_top":false,"time":"14:30","sunset":"19:15",...}
 
 # Force lights on (e.g., from a script or home automation)
 curl "http://192.168.1.42/api/override?mode=on"
@@ -53,7 +54,8 @@ curl "http://192.168.1.42/api/override?mode=auto"
 | Component | Purpose | GPIO |
 |-----------|---------|------|
 | ESP32-S3 SuperMini | Controller | — |
-| HC-SR501 PIR | Motion detection | 4 (digital) |
+| HC-SR501 PIR (bottom) | Motion detection (bottom of stairs) | 4 (digital) |
+| HC-SR501 PIR (top) | Motion detection (top of stairs) | 6 (digital) |
 | BH1750 | Ambient light sensor | 21 (SDA), 22 (SCL) |
 | IRLZ44N MOSFET | Switch 12V LED strip | 5 (PWM-capable) |
 | 12V LED strip (5m) | Staircase lighting | MOSFET drain |
@@ -64,11 +66,12 @@ curl "http://192.168.1.42/api/override?mode=auto"
 ```
 ESP32-S3          Peripheral
 ────────          ──────────
-GPIO 4   ──────── HC-SR501 OUT
+GPIO 4   ──────── HC-SR501 OUT (bottom PIR)
+GPIO 6   ──────── HC-SR501 OUT (top PIR)
 GPIO 21  ──────── BH1750 SDA
 GPIO 22  ──────── BH1750 SCL
-3.3V    ──────── HC-SR501 VCC, BH1750 VCC
-GND     ──────── HC-SR501 GND, BH1750 GND
+3.3V    ──────── HC-SR501 VCC (×2), BH1750 VCC
+GND     ──────── HC-SR501 GND (×2), BH1750 GND
 
 MOSFET circuit:
 GPIO 5 ──[10KΩ]──┬── IRLZ44N GATE
@@ -130,8 +133,8 @@ arduino-cli monitor -p /dev/ttyUSB0 -c baudrate=115200
 [🌅] Sunset: 2026-06-27T01:15:00 UTC  |  Sunrise: 2026-06-26T12:00:00 UTC
 [🌐] Dashboard: http://192.168.1.42/
 --- Ready ---
-[STATUS] 14:30:15 | Lux: 450 | Motion: no | Lights: OFF | Sunset: 19:15 | Mode: AUTO
-[👣] Motion detected!
+[STATUS] 14:30:15 | Lux: 450 | Motion bottom: no | Motion top: no | Lights: OFF | Sunset: 19:15 | Mode: AUTO
+[👣] Motion detected — bottom!
 [💡] Decision: ON  (motion=1 dark=1 night=1 lux=3)
 [💡] Lights → ON
 [🕹] Override → FORCE OFF

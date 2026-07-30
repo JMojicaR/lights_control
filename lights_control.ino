@@ -8,7 +8,7 @@
  *   3. Time of day vs sunset (HTTP APIs)
  *
  * Lights turn ON when: motion detected AND it's dark AND past sunset.
- * Lights stay ON for LIGHT_DURATION_SEC after last motion, then turn OFF.
+ * Lights stay ON for a configurable duration (default 120s) after last motion,
  *
  * Web Dashboard: http://<esp32-ip>/
  *   - Live status: lux, motion, lights, time, sunset
@@ -20,7 +20,8 @@
  *
  * Hardware:
  *   - ESP32-S3 SuperMini
- *   - HC-SR501 PIR motion sensor (GPIO 4)
+ *   - HC-SR501 PIR motion sensor — bottom of stairs (GPIO 4)
+ *   - HC-SR501 PIR motion sensor — top of stairs (GPIO 6)
  *   - BH1750 ambient light sensor (I²C: SDA 21, SCL 22)
  *   - IRLZ44N MOSFET switching 12V LED strip (GPIO 5)
  *   - 12V DC power supply (≥6A for 5m strip)
@@ -33,10 +34,16 @@
 #include <BH1750.h>
 #include <ArduinoJson.h>
 #include <WebServer.h>
+#include <time.h>
+#include <Preferences.h>
 
 // ── Objects ─────────────────────────────────────
 BH1750 lightMeter;
 WebServer server(80);
+Preferences prefs;
+
+const char* PREF_NAMESPACE = "stairs";
+const char* PREF_KEY_DURATION = "dur_sec";
 
 // ── Time tracking ───────────────────────────────
 unsigned long lastTimeSync   = 0;      // millis() of last HTTP time sync
@@ -46,17 +53,28 @@ time_t        sunsetEpoch    = 0;      // today's sunset Unix time
 time_t        sunriseEpoch   = 0;      // today's sunrise Unix time
 bool          timeValid      = false;
 bool          sunsetValid    = false;
+int           localUtcOffsetSec = -6 * 3600; // Updated from time API (Mexico City offset)
 const unsigned long TIME_RESYNC_MS   = TIME_RESYNC_MIN  * 60000UL;
 const unsigned long SUNSET_RESYNC_MS = SUNSET_RESYNC_MIN * 60000UL;
 
 // ── Motion tracking ─────────────────────────────
-bool     motionActive    = false;
+bool     motionActiveBottom = false;
+bool     motionActiveTop    = false;
 unsigned long lastMotionTime = 0;
 unsigned long motionDebounceUntil = 0;
 
 // ── Light state ─────────────────────────────────
 bool     lightsOn        = false;
 unsigned long lightsOnSince  = 0;
+
+// ── PWM Fade ────────────────────────────────────
+int      currentDuty     = 0;     // Current PWM duty cycle (0-255)
+int      targetDuty      = 0;     // Desired PWM duty cycle
+unsigned long fadeStartMs = 0;    // When the current fade began
+
+// ── Dynamic light duration (changeable via HTTP) ─
+unsigned long configuredDurationSec = DEFAULT_LIGHT_DURATION_SEC; // Used for new sessions
+unsigned long activeDurationSec     = DEFAULT_LIGHT_DURATION_SEC; // Locked for current session
 
 // ── Manual override ─────────────────────────────
 //  0 = AUTO (use sensor/sunset logic)
@@ -78,12 +96,35 @@ void setup() {
     delay(250);
     Serial.println("\n=== Staircase Light Controller ===\n");
 
-    // Pins
-    pinMode(PIR_PIN, INPUT);
-    pinMode(LED_MOSFET_PIN, OUTPUT);
+    // Load persisted configured duration (fallback to compile-time default).
+    if (prefs.begin(PREF_NAMESPACE, true)) {
+      unsigned long saved = prefs.getULong(PREF_KEY_DURATION, DEFAULT_LIGHT_DURATION_SEC);
+      prefs.end();
+
+      if (saved >= DURATION_MIN_SEC && saved <= DURATION_MAX_SEC) {
+        configuredDurationSec = saved;
+      } else {
+        configuredDurationSec = DEFAULT_LIGHT_DURATION_SEC;
+        Serial.printf("[⚠] Stored duration invalid (%lu) — using default %lu\n",
+                saved, configuredDurationSec);
+      }
+    } else {
+      configuredDurationSec = DEFAULT_LIGHT_DURATION_SEC;
+      Serial.printf("[⚠] Preferences unavailable — using default duration %lu\n",
+              configuredDurationSec);
+    }
+    activeDurationSec = configuredDurationSec;
+    Serial.printf("[⚙] Configured duration loaded: %lus\n", configuredDurationSec);
+
+    // Pins — LED MOSFET uses PWM for fade
+    pinMode(PIR_PIN_BOTTOM, INPUT);
+    pinMode(PIR_PIN_TOP, INPUT);
     pinMode(STATUS_LED_PIN, OUTPUT);
-    digitalWrite(LED_MOSFET_PIN, LOW);
     digitalWrite(STATUS_LED_PIN, LOW);
+
+    // PWM setup for LED MOSFET (8-bit, 5 kHz — silent, smooth fade)
+    ledcAttach(LED_MOSFET_PIN, PWM_FREQ, PWM_RES);
+    ledcWrite(LED_MOSFET_PIN, 0);
 
     // I²C for BH1750
     Wire.begin(I2C_SDA, I2C_SCL);
@@ -104,6 +145,7 @@ void setup() {
     server.on("/", handleRoot);
     server.on("/api", handleAPI);
     server.on("/api/override", handleOverride);
+    server.on("/api/duration", handleDuration);
     server.onNotFound([]() {
         server.send(404, "application/json", "{\"error\":\"not found\"}");
     });
@@ -141,6 +183,9 @@ void loop() {
     // ── Control lights ───────────────────────────
     setLights(shouldLight);
 
+    // ── PWM fade tick (non-blocking, steps each loop) ──
+    updateFade();
+
     // ── Status LED heartbeat ─────────────────────
     digitalWrite(STATUS_LED_PIN, lightsOn ? HIGH : (now / 1000) % 2);
 
@@ -174,6 +219,73 @@ void connectWiFi() {
 }
 
 // ═════════════════════════════════════════════════
+// Time Helpers (UTC-safe)
+// ═════════════════════════════════════════════════
+
+long daysFromCivil(int y, unsigned m, unsigned d) {
+  y -= m <= 2;
+  const int era = (y >= 0 ? y : y - 399) / 400;
+  const unsigned yoe = (unsigned)(y - era * 400);
+  const unsigned doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+  const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+  return era * 146097L + (long)doe - 719468L;
+}
+
+time_t buildUtcEpoch(int year, int month, int day, int hour, int minute, int second) {
+  long days = daysFromCivil(year, (unsigned)month, (unsigned)day);
+  long long secs = (long long)days * 86400LL +
+           (long long)hour * 3600LL +
+           (long long)minute * 60LL +
+           (long long)second;
+  return (time_t)secs;
+}
+
+int parseIsoOffsetSeconds(const String& iso) {
+  int n = iso.length();
+  if (n >= 1 && iso.charAt(n - 1) == 'Z') {
+    return 0;
+  }
+  if (n >= 6 && (iso.charAt(n - 6) == '+' || iso.charAt(n - 6) == '-') && iso.charAt(n - 3) == ':') {
+    int sign = (iso.charAt(n - 6) == '-') ? -1 : 1;
+    int offH = atoi(iso.substring(n - 5, n - 3).c_str());
+    int offM = atoi(iso.substring(n - 2, n).c_str());
+    return sign * ((offH * 3600) + (offM * 60));
+  }
+  return 0;
+}
+
+time_t isoToEpoch(const char* iso) {
+  String s = String(iso);
+  if (s.length() < 19) return 0;
+
+  int year   = atoi(s.substring(0, 4).c_str());
+  int month  = atoi(s.substring(5, 7).c_str());
+  int day    = atoi(s.substring(8, 10).c_str());
+  int hour   = atoi(s.substring(11, 13).c_str());
+  int minute = atoi(s.substring(14, 16).c_str());
+  int second = atoi(s.substring(17, 19).c_str());
+  int offsetSec = parseIsoOffsetSeconds(s);
+
+  // ISO timestamp encodes local wall time + offset. Convert to UTC epoch.
+  time_t wallEpoch = buildUtcEpoch(year, month, day, hour, minute, second);
+  return wallEpoch - offsetSec;
+}
+
+void formatHHMMFromEpoch(time_t epochUtc, int utcOffsetSec, char* out, size_t outSize) {
+  time_t localEpoch = epochUtc + utcOffsetSec;
+  struct tm tmUtc = {};
+  gmtime_r(&localEpoch, &tmUtc);
+  strftime(out, outSize, "%H:%M", &tmUtc);
+}
+
+void formatHHMMSSFromEpoch(time_t epochUtc, int utcOffsetSec, char* out, size_t outSize) {
+  time_t localEpoch = epochUtc + utcOffsetSec;
+  struct tm tmUtc = {};
+  gmtime_r(&localEpoch, &tmUtc);
+  strftime(out, outSize, "%H:%M:%S", &tmUtc);
+}
+
+// ═════════════════════════════════════════════════
 // HTTP: Sync current time from timeapi.io
 // ═════════════════════════════════════════════════
 void syncTime() {
@@ -196,25 +308,24 @@ void syncTime() {
         if (!err) {
             const char* dt = doc["date_time"];       // "2026-07-10T16:19:26.627199-06:00"
             int utcOffset = doc["utc_offset_seconds"];// seconds offset from UTC
-            bool dstActive = doc["dst_active"];       // true if DST is in effect
+          bool dstActive = doc["dst_active"];
 
-            // Parse ISO datetime to epoch (simple approach: extract and use mktime)
-            // Format: "2026-07-10T16:19:26.627199-06:00"
-            struct tm t = {};
-            t.tm_year = atoi(String(dt).substring(0, 4).c_str()) - 1900;
-            t.tm_mon  = atoi(String(dt).substring(5, 7).c_str()) - 1;
-            t.tm_mday = atoi(String(dt).substring(8, 10).c_str());
-            t.tm_hour = atoi(String(dt).substring(11, 13).c_str());
-            t.tm_min  = atoi(String(dt).substring(14, 16).c_str());
-            t.tm_sec  = atoi(String(dt).substring(17, 19).c_str());
-            t.tm_isdst = dstActive ? 1 : 0;
+          time_t parsedEpoch = isoToEpoch(dt);
+          if (parsedEpoch == 0) {
+            Serial.println("[✗] Time parse error");
+            http.end();
+            return;
+          }
 
-            currentEpoch = mktime(&t);
+          currentEpoch = parsedEpoch;
+          localUtcOffsetSec = utcOffset;
             timeValid = true;
             lastTimeSync = millis();
 
-            Serial.printf("[⏰] Time synced: %s (UTC%+d, DST=%s)\n",
-                          dt, utcOffset / 3600, dstActive ? "yes" : "no");
+          char localNow[16];
+          formatHHMMSSFromEpoch(currentEpoch, localUtcOffsetSec, localNow, sizeof(localNow));
+          Serial.printf("[⏰] Time synced: %s | Local: %s | UTC offset: %+d h (DST=%s)\n",
+                  dt, localNow, utcOffset / 3600, dstActive ? "yes" : "no");
         } else {
             Serial.printf("[✗] Time JSON parse error: %s\n", err.c_str());
         }
@@ -256,8 +367,11 @@ void syncSunset() {
             sunsetValid  = true;
             lastSunsetSync = millis();
 
-            Serial.printf("[🌅] Sunset: %s UTC  |  Sunrise: %s UTC\n",
-                          sunsetStr, sunriseStr);
+          char sunsetLocal[8];
+          formatHHMMFromEpoch(sunsetEpoch, localUtcOffsetSec, sunsetLocal, sizeof(sunsetLocal));
+
+          Serial.printf("[🌅] Sunset API(UTC): %s | Sunset local(MX): %s | Sunrise API(UTC): %s\n",
+                  sunsetStr, sunsetLocal, sunriseStr);
         } else {
             Serial.printf("[✗] Sunset JSON error: %s\n", err.c_str());
         }
@@ -271,24 +385,45 @@ void syncSunset() {
 // Sensors
 // ═════════════════════════════════════════════════
 void readSensors() {
-    // PIR motion
-    int pir = digitalRead(PIR_PIN);
     unsigned long now = millis();
+  bool sessionWasActive = (motionActiveBottom || motionActiveTop);
 
-    if (pir == HIGH && now >= motionDebounceUntil) {
-        // Rising edge — motion detected
-        if (!motionActive) {
-            Serial.println("[👣] Motion detected!");
+    // PIR — bottom of stairs
+    int pirBottom = digitalRead(PIR_PIN_BOTTOM);
+    if (pirBottom == HIGH && now >= motionDebounceUntil) {
+        if (!motionActiveBottom) {
+            Serial.println("[👣] Motion detected — bottom!");
         }
-        motionActive = true;
+        motionActiveBottom = true;
         lastMotionTime = now;
         motionDebounceUntil = now + MOTION_DEBOUNCE_MS;
     }
 
-    // Motion timeout
-    if (motionActive && (now - lastMotionTime > LIGHT_DURATION_SEC * 1000UL)) {
-        motionActive = false;
-        Serial.println("[👣] Motion timeout — no movement");
+    // PIR — top of stairs
+    int pirTop = digitalRead(PIR_PIN_TOP);
+    if (pirTop == HIGH && now >= motionDebounceUntil) {
+        if (!motionActiveTop) {
+            Serial.println("[👣] Motion detected — top!");
+        }
+        motionActiveTop = true;
+        lastMotionTime = now;
+        motionDebounceUntil = now + MOTION_DEBOUNCE_MS;
+    }
+
+    // Start a new motion session only when transitioning from idle -> active.
+    bool sessionNowActive = (motionActiveBottom || motionActiveTop);
+    if (!sessionWasActive && sessionNowActive) {
+      activeDurationSec = configuredDurationSec;
+      Serial.printf("[⏱] New motion session — duration locked at %lus\n", activeDurationSec);
+    }
+
+    // Motion timeout: clear both PIR states when no motion for duration
+    bool anyMotion = (motionActiveBottom || motionActiveTop);
+    if (anyMotion && (now - lastMotionTime > activeDurationSec * 1000UL)) {
+        if (motionActiveBottom) Serial.println("[👣] Motion timeout — bottom");
+        if (motionActiveTop)    Serial.println("[👣] Motion timeout — top");
+        motionActiveBottom = false;
+        motionActiveTop    = false;
     }
 
     // BH1750 — ambient light (lux)
@@ -323,8 +458,8 @@ bool evaluate() {
     // Between sunrise and sunset = daytime → no lights needed
     bool isNight = (nowEpoch >= sunsetEpoch || nowEpoch < sunriseEpoch);
 
-    // Condition 3: Was motion recently detected?
-    bool hasMotion = motionActive;
+    // Condition 3: Was motion recently detected by either PIR?
+    bool hasMotion = (motionActiveBottom || motionActiveTop);
 
     // Decision table:
     //   motion + dark + night → ON
@@ -342,20 +477,49 @@ bool evaluate() {
 }
 
 // ═════════════════════════════════════════════════
-// Light Control
+// Light Control — PWM fade-based
 // ═════════════════════════════════════════════════
 void setLights(bool on) {
     if (on && !lightsOn) {
-        digitalWrite(LED_MOSFET_PIN, HIGH);
+        // Begin fade-in: set target to full brightness
+        targetDuty = 255;
         lightsOn = true;
         lightsOnSince = millis();
         const char* mode = (overrideMode == 1) ? " (OVERRIDE)" : "";
-        Serial.printf("[💡] Lights → ON%s\n", mode);
+        Serial.printf("[💡] Lights → ON%s (fading in)\\n", mode);
     } else if (!on && lightsOn) {
-        digitalWrite(LED_MOSFET_PIN, LOW);
+        // Begin fade-out: set target to 0
+        targetDuty = 0;
         lightsOn = false;
         const char* mode = (overrideMode == -1) ? " (OVERRIDE)" : "";
-        Serial.printf("[💡] Lights → OFF%s\n", mode);
+        Serial.printf("[💡] Lights → OFF%s (fading out)\\n", mode);
+    }
+}
+
+// ═════════════════════════════════════════════════
+// PWM Fade Tick — called every loop iteration
+// ═════════════════════════════════════════════════
+void updateFade() {
+    if (currentDuty == targetDuty) return;  // nothing to do
+
+    unsigned long now = millis();
+
+    if (currentDuty < targetDuty) {
+        // Fading IN
+        currentDuty = min(currentDuty + FADE_STEP, targetDuty);
+    } else {
+        // Fading OUT
+        currentDuty = max(currentDuty - FADE_STEP, 0);
+    }
+    ledcWrite(LED_MOSFET_PIN, currentDuty);
+
+    // Log when fade completes
+    if (currentDuty == targetDuty) {
+        if (currentDuty == 255) {
+            Serial.println("[💡] Fade-in complete → full brightness");
+        } else if (currentDuty == 0) {
+            Serial.println("[💡] Fade-out complete → lights off");
+        }
     }
 }
 
@@ -363,38 +527,33 @@ void setLights(bool on) {
 // Helpers
 // ═════════════════════════════════════════════════
 
-// Convert ISO 8601 string to Unix epoch
-// Input: "2026-06-27T01:15:00+00:00"
-time_t isoToEpoch(const char* iso) {
-    struct tm t = {};
-    t.tm_year = atoi(String(iso).substring(0, 4).c_str()) - 1900;
-    t.tm_mon  = atoi(String(iso).substring(5, 7).c_str()) - 1;
-    t.tm_mday = atoi(String(iso).substring(8, 10).c_str());
-    t.tm_hour = atoi(String(iso).substring(11, 13).c_str());
-    t.tm_min  = atoi(String(iso).substring(14, 16).c_str());
-    t.tm_sec  = atoi(String(iso).substring(17, 19).c_str());
-    t.tm_isdst = 0;
-    return mktime(&t);
-}
-
 // Print status report
 void printStatus() {
     time_t now = currentEpoch + ((millis() - lastTimeSync) / 1000);
-    struct tm* local = localtime(&now);
 
     char timeStr[16];
-    strftime(timeStr, sizeof(timeStr), "%H:%M:%S", local);
+  formatHHMMSSFromEpoch(now, localUtcOffsetSec, timeStr, sizeof(timeStr));
 
     char sunsetStr[16];
-    struct tm* sun = localtime(&sunsetEpoch);
-    strftime(sunsetStr, sizeof(sunsetStr), "%H:%M", sun);
+  formatHHMMFromEpoch(sunsetEpoch, localUtcOffsetSec, sunsetStr, sizeof(sunsetStr));
 
-    Serial.printf("[STATUS] %s | Lux: %.0f | Motion: %s | Lights: %s | Sunset: %s | Mode: %s\n",
+    Serial.printf("[STATUS] %s | Lux: %.0f | Motion bottom: %s | Motion top: %s | Lights: %s", 
                   timeStr, lux,
-                  motionActive ? "YES" : "no",
-                  lightsOn ? "ON" : "OFF",
+                  motionActiveBottom ? "YES" : "no",
+                  motionActiveTop ? "YES" : "no",
+                  currentDuty > 0 ? "ON" : "OFF");
+
+    // Remaining time when lights are on
+    if (currentDuty > 0 && (motionActiveBottom || motionActiveTop)) {
+        unsigned long remaining = activeDurationSec - ((millis() - lastMotionTime) / 1000);
+        Serial.printf(" | Remaining: %lus", remaining);
+    }
+
+      Serial.printf(" | Sunset: %s | Mode: %s | Duration(set): %lus | Duration(active): %lus\n",
                   sunsetStr,
-                  overrideMode == 1 ? "FORCE ON" : (overrideMode == -1 ? "FORCE OFF" : "AUTO"));
+                  overrideMode == 1 ? "FORCE ON" : (overrideMode == -1 ? "FORCE OFF" : "AUTO"),
+              configuredDurationSec,
+              activeDurationSec);
 }
 
 // ═════════════════════════════════════════════════
@@ -428,7 +587,15 @@ void handleRoot() {
   .motion .value{color:#a78bfa}
   .sunset .value{color:#fb923c}
   .time .value{color:#e2e8f0}
+  .remaining .value{color:#34d399}
   .motion.active .value{color:#f87171}
+  .remaining.warning .value{color:#fbbf24;animation:pulse 1s infinite}
+  .remaining.urgent .value{color:#f87171;animation:pulse .5s infinite}
+  .duration-row{display:flex;gap:8px;margin-top:12px;align-items:center}
+  .duration-row label{font-size:.75rem;color:#94a3b8;white-space:nowrap}
+  .duration-row input{flex:1;background:#0f172a;border:1px solid #334155;border-radius:8px;padding:8px 10px;color:#e2e8f0;font-size:.85rem;text-align:center}
+  .duration-row input:focus{outline:none;border-color:#3b82f6}
+  .duration-row .btn-sm{flex:0;padding:8px 14px;font-size:.8rem}
   .btn-row{display:flex;gap:8px;margin-top:4px}
   .btn{flex:1;background:#1e293b;border:1px solid #334155;border-radius:10px;padding:12px 8px;color:#cbd5e1;font-size:.85rem;font-weight:600;cursor:pointer;transition:all .15s}
   .btn:hover{background:#334155}
@@ -455,9 +622,13 @@ void handleRoot() {
       <div class="label">☀️ Ambient Light</div>
       <div class="value" id="lux">--</div>
     </div>
-    <div class="tile motion" id="motionTile">
-      <div class="label">👣 Motion</div>
-      <div class="value" id="motion">--</div>
+    <div class="tile motion" id="motionTileB">
+      <div class="label">👣 Motion Bottom</div>
+      <div class="value" id="motionB">--</div>
+    </div>
+    <div class="tile motion" id="motionTileT">
+      <div class="label">👣 Motion Top</div>
+      <div class="value" id="motionT">--</div>
     </div>
     <div class="tile time">
       <div class="label">🕐 Local Time</div>
@@ -467,6 +638,16 @@ void handleRoot() {
       <div class="label">🌅 Sunset</div>
       <div class="value" id="sunset">--</div>
     </div>
+    <div class="tile remaining" id="remainingTile" style="grid-column:1/-1">
+      <div class="label">⏳ Remaining</div>
+      <div class="value" id="remaining">--</div>
+    </div>
+  </div>
+
+  <div class="duration-row">
+    <label for="durInput">⏱ Duration:</label>
+    <input type="number" id="durInput" min="5" max="1800" step="5" value="120">
+    <button class="btn btn-sm" onclick="setDuration()">Set</button>
   </div>
 
   <div class="btn-row">
@@ -485,6 +666,11 @@ const ip = window.location.host;
 document.getElementById('ip').textContent = 'http://' + ip + '/';
 
 let currentOverride = 'auto';
+let durationEditing = false;
+
+const durInputEl = document.getElementById('durInput');
+durInputEl.addEventListener('focus', () => { durationEditing = true; });
+durInputEl.addEventListener('blur', () => { durationEditing = false; });
 
 async function fetchData() {
   try {
@@ -507,15 +693,26 @@ async function fetchData() {
     // Lux
     document.getElementById('lux').innerHTML = d.lux.toFixed(0) + ' <small style="font-size:.65rem;opacity:.6">lux</small>';
 
-    // Motion
-    const mTile = document.getElementById('motionTile');
-    const mMetric = document.getElementById('motion');
-    if (d.motion) {
-      mTile.className = 'tile motion active';
-      mMetric.textContent = 'Active';
+    // Motion — bottom
+    const mTileB = document.getElementById('motionTileB');
+    const mMetricB = document.getElementById('motionB');
+    if (d.motion_bottom) {
+      mTileB.className = 'tile motion active';
+      mMetricB.textContent = 'Active';
     } else {
-      mTile.className = 'tile motion';
-      mMetric.textContent = 'Idle';
+      mTileB.className = 'tile motion';
+      mMetricB.textContent = 'Idle';
+    }
+
+    // Motion — top
+    const mTileT = document.getElementById('motionTileT');
+    const mMetricT = document.getElementById('motionT');
+    if (d.motion_top) {
+      mTileT.className = 'tile motion active';
+      mMetricT.textContent = 'Active';
+    } else {
+      mTileT.className = 'tile motion';
+      mMetricT.textContent = 'Idle';
     }
 
     // Time
@@ -527,6 +724,27 @@ async function fetchData() {
     // Override mode
     currentOverride = d.override;
     updateButtons(currentOverride);
+
+    // Remaining time
+    const remTile = document.getElementById('remainingTile');
+    const remEl = document.getElementById('remaining');
+    if (d.lights_on && d.remaining_sec > 0) {
+      const m = Math.floor(d.remaining_sec / 60);
+      const s = d.remaining_sec % 60;
+      remEl.textContent = m + 'm ' + s + 's';
+      remTile.className = 'tile remaining' + (d.remaining_sec <= 30 ? ' urgent' : (d.remaining_sec <= 60 ? ' warning' : ''));
+    } else if (d.lights_on) {
+      remEl.textContent = 'Fading...';
+      remTile.className = 'tile remaining';
+    } else {
+      remEl.textContent = '—';
+      remTile.className = 'tile remaining';
+    }
+
+    // Duration: do not overwrite user draft while editing.
+    if (!durationEditing) {
+      document.getElementById('durInput').value = d.duration_sec;
+    }
 
     // Uptime
     document.getElementById('uptime').textContent = 'Uptime ' + d.uptime;
@@ -555,6 +773,21 @@ async function setOverride(mode) {
   }
 }
 
+async function setDuration() {
+  const secs = document.getElementById('durInput').value;
+  try {
+    const r = await fetch('/api/duration?seconds=' + secs, {method:'POST'});
+    const d = await r.json();
+    if (d.ok) {
+      document.getElementById('durInput').value = d.duration_sec;
+    } else if (d.error) {
+      alert(d.error);
+    }
+  } catch(e) {
+    console.error('Duration error:', e);
+  }
+}
+
 fetchData();
 setInterval(fetchData, 2000);
 </script>
@@ -569,14 +802,12 @@ setInterval(fetchData, 2000);
 // ═════════════════════════════════════════════════
 void handleAPI() {
     time_t now = currentEpoch + ((millis() - lastTimeSync) / 1000);
-    struct tm* local = localtime(&now);
 
     char timeStr[8];  // "HH:MM" or "HH:MM:SS"
-    strftime(timeStr, sizeof(timeStr), "%H:%M", local);
+  formatHHMMFromEpoch(now, localUtcOffsetSec, timeStr, sizeof(timeStr));
 
     char sunsetStr[8];
-    struct tm* sun = localtime(&sunsetEpoch);
-    strftime(sunsetStr, sizeof(sunsetStr), "%H:%M", sun);
+  formatHHMMFromEpoch(sunsetEpoch, localUtcOffsetSec, sunsetStr, sizeof(sunsetStr));
 
     // Uptime as human-readable string
     unsigned long uptimeSec = (millis() - bootMillis) / 1000;
@@ -592,20 +823,33 @@ void handleAPI() {
         snprintf(uptimeStr, sizeof(uptimeStr), "%lud %luh",
                  uptimeSec / 86400, (uptimeSec % 86400) / 3600);
 
+    // Compute remaining time (seconds) when lights are on
+    long remainingSec = 0;
+    if (currentDuty > 0 && (motionActiveBottom || motionActiveTop)) {
+        long elapsed = (millis() - lastMotionTime) / 1000;
+      remainingSec = (long)activeDurationSec - elapsed;
+        if (remainingSec < 0) remainingSec = 0;
+    }
+
     const char* overrideStr = (overrideMode == 1) ? "on"
                             : (overrideMode == -1) ? "off"
                             : "auto";
 
     String json = "{";
-    json += "\"lights_on\":" + String(lightsOn ? "true" : "false") + ",";
+    json += "\"lights_on\":" + String(currentDuty > 0 ? "true" : "false") + ",";
+    json += "\"duty\":" + String(currentDuty) + ",";
     json += "\"lux\":" + String(lux, 1) + ",";
-    json += "\"motion\":" + String(motionActive ? "true" : "false") + ",";
+    json += "\"motion_bottom\":" + String(motionActiveBottom ? "true" : "false") + ",";
+    json += "\"motion_top\":" + String(motionActiveTop ? "true" : "false") + ",";
     json += "\"time\":\"" + String(timeStr) + "\",";
     json += "\"sunset\":\"" + String(sunsetStr) + "\",";
     json += "\"override\":\"" + String(overrideStr) + "\",";
     json += "\"uptime\":\"" + String(uptimeStr) + "\",";
     json += "\"rssi\":" + String(WiFi.RSSI()) + ",";
-    json += "\"ip\":\"" + WiFi.localIP().toString() + "\"";
+    json += "\"ip\":\"" + WiFi.localIP().toString() + "\",";
+    json += "\"duration_sec\":" + String(configuredDurationSec) + ",";
+    json += "\"active_duration_sec\":" + String(activeDurationSec) + ",";
+    json += "\"remaining_sec\":" + String(remainingSec);
     json += "}";
 
     server.send(200, "application/json", json);
@@ -646,4 +890,51 @@ void handleOverride() {
     server.send(200, "application/json",
                 "{\"override\":\"" + String(overrideStr) + "\",\"lights_on\":" +
                 String(lightsOn ? "true" : "false") + "}");
+}
+
+// ═════════════════════════════════════════════════
+// Duration endpoint — /api/duration
+//   GET          → returns current duration in seconds
+//   POST ?seconds=N  → sets new duration (clamped)
+// ═════════════════════════════════════════════════
+void handleDuration() {
+    if (server.method() == HTTP_POST || server.hasArg("seconds")) {
+        // Set new duration
+        String val = server.arg("seconds");
+        long newDuration = val.toInt();
+
+        if (newDuration < DURATION_MIN_SEC || newDuration > DURATION_MAX_SEC) {
+            char err[128];
+            snprintf(err, sizeof(err),
+                     "{\"error\":\"duration must be %d–%d seconds\"}",
+                     DURATION_MIN_SEC, DURATION_MAX_SEC);
+            server.send(400, "application/json", err);
+            return;
+        }
+
+        configuredDurationSec = (unsigned long)newDuration;
+        Serial.printf("[⚙] Duration set to %lus (HTTP, applies to next session)\\n", configuredDurationSec);
+
+        bool persisted = false;
+        if (prefs.begin(PREF_NAMESPACE, false)) {
+          persisted = (prefs.putULong(PREF_KEY_DURATION, configuredDurationSec) > 0);
+          prefs.end();
+        }
+        if (!persisted) {
+          Serial.println("[⚠] Failed to persist duration to NVS");
+        }
+
+        char resp[192];
+        snprintf(resp, sizeof(resp),
+           "{\"duration_sec\":%lu,\"active_duration_sec\":%lu,\"persisted\":%s,\"ok\":true}",
+           configuredDurationSec, activeDurationSec, persisted ? "true" : "false");
+        server.send(200, "application/json", resp);
+    } else {
+        // GET — return current duration
+        char resp[192];
+        snprintf(resp, sizeof(resp),
+             "{\"duration_sec\":%lu,\"active_duration_sec\":%lu}",
+             configuredDurationSec, activeDurationSec);
+        server.send(200, "application/json", resp);
+    }
 }
