@@ -204,6 +204,21 @@ void loop() {
 // ═════════════════════════════════════════════════
 void connectWiFi() {
     Serial.printf("WiFi: connecting to %s", WIFI_SSID);
+
+#ifdef WIFI_STATIC_IP
+    IPAddress staticIP(WIFI_IP);
+    IPAddress gateway(WIFI_GATEWAY);
+    IPAddress subnet(WIFI_SUBNET);
+    IPAddress dns1(WIFI_DNS1);
+    IPAddress dns2(WIFI_DNS2);
+
+    if (!WiFi.config(staticIP, gateway, subnet, dns1, dns2)) {
+        Serial.println("\n[⚠] Static IP config failed — falling back to DHCP");
+    } else {
+        Serial.printf("\n[⚙] Static IP configured: %s", staticIP.toString().c_str());
+    }
+#endif
+
     WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
     int attempts = 0;
     while (WiFi.status() != WL_CONNECTED && attempts < 40) {

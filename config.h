@@ -5,6 +5,18 @@
 #define WIFI_SSID       "SSID"
 #define WIFI_PASSWORD   "PASSWORD"
 
+// Static IP configuration (comment out to use DHCP)
+// When uncommented, the ESP32 will use a fixed IP instead of requesting
+// one from the router — no need to connect via serial to discover the IP.
+#define WIFI_STATIC_IP
+#ifdef WIFI_STATIC_IP
+  #define WIFI_IP       192, 168, 1, 200   // Static IP for the ESP32
+  #define WIFI_GATEWAY  192, 168, 1, 1     // Router / gateway
+  #define WIFI_SUBNET   255, 255, 255, 0   // Subnet mask
+  #define WIFI_DNS1     192, 168, 1, 1     // Primary DNS (usually same as gateway)
+  #define WIFI_DNS2     8, 8, 8, 8         // Secondary DNS (Google / fallback)
+#endif
+
 // ── Location & Timezone ─────────────────────────
 // Used for the sunset API (sunrise-sunset.org)
 #define LATITUDE        19.4326    // Mexico City (change to your location)
