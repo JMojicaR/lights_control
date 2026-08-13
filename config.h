@@ -37,15 +37,18 @@
 #define VL53L0X_ADDR_DEFAULT  0x29  // Default I²C address (sensor 0 — bottom)
 #define VL53L0X_ADDR_ALT      0x30  // Alternate address for second sensor (top)
 // Presence detection window (mm): distance >= MIN and distance < threshold → person detected
-#define VL53L0X_MIN_PRESENCE_MM  150   // 15cm — readings below this are ignored (ghost/crosstalk)
-#define DISTANCE_DEFAULT_MM      1200  // Default presence distance threshold (1.2m), configurable via HTTP
-#define DISTANCE_MIN_MM          150   // Shortest allowed presence distance (15cm)
-#define DISTANCE_MAX_MM          2000  // Longest allowed presence distance (2m)
+// Measure range: 3cm to 7cm (30–70mm)
+#define VL53L0X_MIN_PRESENCE_MM  30    // 3cm — readings below this are ignored (ghost/crosstalk)
+#define DISTANCE_DEFAULT_MM      70    // Default presence distance threshold (7cm), configurable via HTTP
+#define DISTANCE_MIN_MM          30    // Shortest allowed presence distance (3cm)
+#define DISTANCE_MAX_MM          70    // Longest allowed presence distance (7cm)
 // Range status: 0=valid, other=out-of-range or error
 #define VL53L0X_TIMING_BUDGET_MS  33  // 33ms = standard speed (~1.2m range)
 
 // ── Timing ──────────────────────────────────────
-#define SENSOR_POLL_MARGIN_SEC  5     // Poll sensors this many seconds LONGER than the light duration
+#define POLL_INTERVAL_DEFAULT_SEC  5    // Default sensor polling interval (seconds), configurable via HTTP
+#define POLL_INTERVAL_MIN_SEC      1    // Shortest allowed polling interval
+#define POLL_INTERVAL_MAX_SEC      300  // Longest allowed polling interval (5 min)
 #define FADE_TICK_MS            250   // PWM fade step interval (keeps fade smooth regardless of polling)
 #define LOOP_DELAY_MS           10    // Base loop delay — keeps web server + heartbeat responsive
 #define TIME_RESYNC_MIN     60    // Re-sync time from HTTP every N minutes

@@ -54,6 +54,7 @@ const char* PREF_NAMESPACE = "stairs";
 const char* PREF_KEY_DURATION = "dur_sec";
 const char* PREF_KEY_DIST_BOTTOM = "dist_bottom_mm";
 const char* PREF_KEY_DIST_TOP = "dist_top_mm";
+const char* PREF_KEY_POLL = "poll_sec";
 
 // ── Time tracking ───────────────────────────────
 unsigned long lastTimeSync   = 0;      // millis() of last HTTP time sync
@@ -93,6 +94,9 @@ unsigned long activeDurationSec     = DEFAULT_LIGHT_DURATION_SEC; // Locked for 
 unsigned long configuredDistanceBottomMm = DISTANCE_DEFAULT_MM;  // bottom sensor presence threshold
 unsigned long configuredDistanceTopMm    = DISTANCE_DEFAULT_MM;  // top sensor presence threshold
 
+// ── Dynamic sensor polling interval (changeable via HTTP) ─
+unsigned long configuredPollIntervalSec = POLL_INTERVAL_DEFAULT_SEC;  // seconds between sensor reads
+
 // ── Manual override ─────────────────────────────
 //  0 = AUTO (use sensor/sunset logic)
 //  1 = FORCE ON
@@ -118,6 +122,7 @@ void setup() {
       unsigned long savedDur = prefs.getULong(PREF_KEY_DURATION, DEFAULT_LIGHT_DURATION_SEC);
       unsigned long savedBottom = prefs.getULong(PREF_KEY_DIST_BOTTOM, DISTANCE_DEFAULT_MM);
       unsigned long savedTop = prefs.getULong(PREF_KEY_DIST_TOP, DISTANCE_DEFAULT_MM);
+      unsigned long savedPoll = prefs.getULong(PREF_KEY_POLL, POLL_INTERVAL_DEFAULT_SEC);
       prefs.end();
 
       if (savedDur >= DURATION_MIN_SEC && savedDur <= DURATION_MAX_SEC) {
@@ -132,14 +137,17 @@ void setup() {
                                    ? savedBottom : DISTANCE_DEFAULT_MM;
       configuredDistanceTopMm    = (savedTop >= DISTANCE_MIN_MM && savedTop <= DISTANCE_MAX_MM)
                                    ? savedTop : DISTANCE_DEFAULT_MM;
+      configuredPollIntervalSec  = (savedPoll >= POLL_INTERVAL_MIN_SEC && savedPoll <= POLL_INTERVAL_MAX_SEC)
+                                   ? savedPoll : POLL_INTERVAL_DEFAULT_SEC;
     } else {
       configuredDurationSec = DEFAULT_LIGHT_DURATION_SEC;
       Serial.printf("[⚠] Preferences unavailable — using default duration %lu\n",
               configuredDurationSec);
     }
     activeDurationSec = configuredDurationSec;
-    Serial.printf("[⚙] Loaded: duration %lus | dist bottom %lumm | dist top %lumm\n",
-                  configuredDurationSec, configuredDistanceBottomMm, configuredDistanceTopMm);
+    Serial.printf("[⚙] Loaded: duration %lus | dist bottom %lumm | dist top %lumm | poll %lus\n",
+                  configuredDurationSec, configuredDistanceBottomMm,
+                  configuredDistanceTopMm, configuredPollIntervalSec);
 
     // Pins — LED MOSFET uses PWM for fade
     pinMode(STATUS_LED_PIN, OUTPUT);
@@ -206,6 +214,7 @@ void setup() {
     server.on("/api/override", handleOverride);
     server.on("/api/duration", handleDuration);
     server.on("/api/distance", handleDistance);
+    server.on("/api/poll", handlePoll);
     server.onNotFound([]() {
         server.send(404, "application/json", "{\"error\":\"not found\"}");
     });
@@ -234,11 +243,11 @@ void loop() {
         syncSunset();
     }
 
-    // ── Sensor polling (duration + margin seconds) ──
-    // The ToF/BH1750 sensors are read on a slow cadence — the configured light
-    // duration plus a fixed margin — while the web server stays fully responsive.
+    // ── Sensor polling (configurable interval, default 5s) ──
+    // The ToF/BH1750 sensors are read on this cadence while the web server stays
+    // fully responsive.
     static unsigned long lastSensorPoll = 0;
-    unsigned long pollIntervalMs = (configuredDurationSec + SENSOR_POLL_MARGIN_SEC) * 1000UL;
+    unsigned long pollIntervalMs = configuredPollIntervalSec * 1000UL;
     if (lastSensorPoll == 0 || now - lastSensorPoll >= pollIntervalMs) {
         lastSensorPoll = now;
         readSensors();
@@ -734,13 +743,19 @@ void handleRoot() {
 
   <div class="duration-row">
     <label for="distBottomInput">📏 Bottom (mm):</label>
-    <input type="number" id="distBottomInput" min="150" max="2000" step="10" value="1200">
+    <input type="number" id="distBottomInput" min="30" max="70" step="1" value="70">
     <button class="btn btn-sm" onclick="setDistance('bottom')">Set</button>
   </div>
   <div class="duration-row">
     <label for="distTopInput">📏 Top (mm):</label>
-    <input type="number" id="distTopInput" min="150" max="2000" step="10" value="1200">
+    <input type="number" id="distTopInput" min="30" max="70" step="1" value="70">
     <button class="btn btn-sm" onclick="setDistance('top')">Set</button>
+  </div>
+
+  <div class="duration-row">
+    <label for="pollInput">⏲ Poll (s):</label>
+    <input type="number" id="pollInput" min="1" max="300" step="1" value="5">
+    <button class="btn btn-sm" onclick="setPoll()">Set</button>
   </div>
 
   <div class="btn-row">
@@ -759,20 +774,11 @@ const ip = window.location.host;
 document.getElementById('ip').textContent = 'http://' + ip + '/';
 
 let currentOverride = 'auto';
-let durationEditing = false;
-let distBottomEditing = false;
-let distTopEditing = false;
 
 const durInputEl = document.getElementById('durInput');
-durInputEl.addEventListener('focus', () => { durationEditing = true; });
-durInputEl.addEventListener('blur', () => { durationEditing = false; });
-
 const distBottomEl = document.getElementById('distBottomInput');
 const distTopEl = document.getElementById('distTopInput');
-distBottomEl.addEventListener('focus', () => { distBottomEditing = true; });
-distBottomEl.addEventListener('blur', () => { distBottomEditing = false; });
-distTopEl.addEventListener('focus', () => { distTopEditing = true; });
-distTopEl.addEventListener('blur', () => { distTopEditing = false; });
+const pollInputEl = document.getElementById('pollInput');
 
 async function fetchData() {
   try {
@@ -851,17 +857,18 @@ async function fetchData() {
       remTile.className = 'tile remaining';
     }
 
-    // Duration: do not overwrite user draft while editing.
-    if (!durationEditing) {
-      document.getElementById('durInput').value = d.duration_sec;
+    // Settings inputs: only refresh values that aren't being actively edited.
+    if (document.activeElement !== durInputEl) {
+      durInputEl.value = d.duration_sec;
     }
-
-    // Distance thresholds: do not overwrite user draft while editing.
-    if (!distBottomEditing) {
-      document.getElementById('distBottomInput').value = d.distance_bottom_mm_set;
+    if (document.activeElement !== distBottomEl) {
+      distBottomEl.value = d.distance_bottom_mm_set;
     }
-    if (!distTopEditing) {
-      document.getElementById('distTopInput').value = d.distance_top_mm_set;
+    if (document.activeElement !== distTopEl) {
+      distTopEl.value = d.distance_top_mm_set;
+    }
+    if (document.activeElement !== pollInputEl) {
+      pollInputEl.value = d.poll_interval_sec;
     }
 
     // Uptime
@@ -921,6 +928,21 @@ async function setDistance(position) {
     }
   } catch(e) {
     console.error('Distance error:', e);
+  }
+}
+
+async function setPoll() {
+  const secs = pollInputEl.value;
+  try {
+    const r = await fetch('/api/poll?seconds=' + secs, {method:'POST'});
+    const d = await r.json();
+    if (d.ok) {
+      pollInputEl.value = d.poll_interval_sec;
+    } else if (d.error) {
+      alert(d.error);
+    }
+  } catch(e) {
+    console.error('Poll error:', e);
   }
 }
 
@@ -989,6 +1011,7 @@ void handleAPI() {
     json += "\"ip\":\"" + WiFi.localIP().toString() + "\",";
     json += "\"duration_sec\":" + String(configuredDurationSec) + ",";
     json += "\"active_duration_sec\":" + String(activeDurationSec) + ",";
+    json += "\"poll_interval_sec\":" + String(configuredPollIntervalSec) + ",";
     json += "\"remaining_sec\":" + String(remainingSec);
     json += "}";
 
@@ -1130,6 +1153,45 @@ void handleDistance() {
         snprintf(resp, sizeof(resp),
                  "{\"distance_bottom_mm\":%lu,\"distance_top_mm\":%lu}",
                  configuredDistanceBottomMm, configuredDistanceTopMm);
+        server.send(200, "application/json", resp);
+    }
+}
+
+// ═════════════════════════════════════════════════
+// Poll interval endpoint — /api/poll
+//   GET  → returns current sensor polling interval (seconds)
+//   POST ?seconds=N → sets interval (clamped)
+// ═════════════════════════════════════════════════
+void handlePoll() {
+    if (server.method() == HTTP_POST || server.hasArg("seconds")) {
+        long newPoll = server.arg("seconds").toInt();
+        if (newPoll < POLL_INTERVAL_MIN_SEC || newPoll > POLL_INTERVAL_MAX_SEC) {
+            char err[128];
+            snprintf(err, sizeof(err),
+                     "{\"error\":\"poll interval must be %d–%d seconds\"}",
+                     POLL_INTERVAL_MIN_SEC, POLL_INTERVAL_MAX_SEC);
+            server.send(400, "application/json", err);
+            return;
+        }
+
+        configuredPollIntervalSec = (unsigned long)newPoll;
+        Serial.printf("[⚙] Poll interval set to %lus (HTTP)\n", configuredPollIntervalSec);
+
+        if (prefs.begin(PREF_NAMESPACE, false)) {
+            prefs.putULong(PREF_KEY_POLL, configuredPollIntervalSec);
+            prefs.end();
+        }
+
+        char resp[128];
+        snprintf(resp, sizeof(resp),
+                 "{\"poll_interval_sec\":%lu,\"ok\":true}",
+                 configuredPollIntervalSec);
+        server.send(200, "application/json", resp);
+    } else {
+        char resp[128];
+        snprintf(resp, sizeof(resp),
+                 "{\"poll_interval_sec\":%lu}",
+                 configuredPollIntervalSec);
         server.send(200, "application/json", resp);
     }
 }
