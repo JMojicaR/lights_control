@@ -157,37 +157,52 @@ void setup() {
     Wire.begin(I2C_SDA, I2C_SCL);
 
     // ── VL53L0X ToF sensor init (two sensors on same I²C bus) ──
-    // Strategy: hold both in shutdown, wake one at a time to assign unique addresses
+    // Strategy: hold both in shutdown, then wake one at a time. The FIRST
+    // sensor woken MUST be moved off the default 0x29 address before the
+    // second wakes — otherwise both boot at 0x29 and a setAddress() write
+    // hits both (address collision → constant 65535 readings).
     pinMode(VL53L0X_XSHUT_BOTTOM, OUTPUT);
     pinMode(VL53L0X_XSHUT_TOP, OUTPUT);
     digitalWrite(VL53L0X_XSHUT_BOTTOM, LOW);  // Hold both in shutdown
     digitalWrite(VL53L0X_XSHUT_TOP, LOW);
     delay(10);
 
-    // Init bottom sensor at default address (0x29)
+    // Init TOP first: wake it at 0x29, then move it to the alternate address
+    // (0x30) so the default 0x29 is free for the bottom sensor.
+    digitalWrite(VL53L0X_XSHUT_TOP, HIGH);
+    delay(10);
+    if (tofTop.init(true)) {  // true = use 2.8V mode (more stable)
+        tofTop.setAddress(VL53L0X_ADDR_ALT);
+        tofTop.setTimeout(500);
+        tofTop.setMeasurementTimingBudget(VL53L0X_TIMING_BUDGET_MS * 1000UL);
+        Serial.printf("[✓] VL53L0X top ready (addr 0x%02X)\n", tofTop.getAddress());
+        tofReady = true;
+    } else {
+        Serial.println("[✗] VL53L0X top not found — check wiring");
+    }
+
+    // Init BOTTOM second: it boots at the default 0x29, now free.
     digitalWrite(VL53L0X_XSHUT_BOTTOM, HIGH);
     delay(10);
-    if (tofBottom.init(true)) {  // true = use 2.8V mode (more stable)
+    if (tofBottom.init(true)) {
         tofBottom.setAddress(VL53L0X_ADDR_DEFAULT);
         tofBottom.setTimeout(500);
         tofBottom.setMeasurementTimingBudget(VL53L0X_TIMING_BUDGET_MS * 1000UL);
-        Serial.println("[✓] VL53L0X bottom ready (addr 0x29)");
+        Serial.printf("[✓] VL53L0X bottom ready (addr 0x%02X)\n", tofBottom.getAddress());
         tofReady = true;
     } else {
         Serial.println("[✗] VL53L0X bottom not found — check wiring");
     }
 
-    // Init top sensor at alternate address (0x30)
-    digitalWrite(VL53L0X_XSHUT_TOP, HIGH);
-    delay(10);
-    if (tofTop.init(true)) {
-        tofTop.setAddress(VL53L0X_ADDR_ALT);
-        tofTop.setTimeout(500);
-        tofTop.setMeasurementTimingBudget(VL53L0X_TIMING_BUDGET_MS * 1000UL);
-        Serial.println("[✓] VL53L0X top ready (addr 0x30)");
-        tofReady = true;
-    } else {
-        Serial.println("[✗] VL53L0X top not found — check wiring");
+    // ── Post-init reachability check ──
+    // Verify each sensor actually answers at its assigned address. This catches
+    // an address collision (a sensor silently moved to the wrong address would
+    // otherwise read as a constant 65535).
+    if (tofBottom.readReg(VL53L0X::IDENTIFICATION_MODEL_ID) != 0xEE) {
+        Serial.println("[⚠] Bottom sensor not reachable at 0x29 — possible address collision");
+    }
+    if (tofTop.readReg(VL53L0X::IDENTIFICATION_MODEL_ID) != 0xEE) {
+        Serial.println("[⚠] Top sensor not reachable at 0x30 — possible address collision");
     }
 
     // BH1750 lux sensor init
