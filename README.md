@@ -13,12 +13,17 @@ Any condition false ────────────────▶ LIGHTS O
 ```
 
 **Decision logic:**
-1. **VL53L0X ToF** (bottom of stairs) measures distance via laser — detects presence when someone is within range (default 1.2m)
-2. **VL53L0X ToF** (top of stairs) — same, for the upper landing
+1. **VL53L0X ToF** (bottom of stairs) measures distance via laser — detects presence when someone is within a configurable range (default 1.2m, floor 15cm)
+2. **VL53L0X ToF** (top of stairs) — same, for the upper landing (independent threshold)
 3. **BH1750** measures ambient light (lux) — ensures lights don't fire during daytime
 4. **sunrise-sunset.org API** provides sunset time for your location — lights only at night
 5. Lights stay ON for a configurable duration (default 90s) after last detection, then turn OFF
 6. **Manual override** via web dashboard — force ON / OFF / AUTO
+
+Presence is only registered when the measured distance is **≥ 15cm** (ignores
+VL53L0X ghost/crosstalk readings near 0mm) **and below the per-sensor threshold**.
+The ToF/BH1750 sensors are polled every `duration + 5s` (e.g. 95s for a 90s
+duration) so the web server stays instantly responsive while the lasers sample slowly.
 
 ### Why VL53L0X instead of PIR?
 
@@ -41,8 +46,10 @@ Open `http://<esp32-ip>/` in any browser on the same network.
 | **Live status** | Lights ON/OFF, ambient lux, distance (cm) bottom/top, local time, sunset |
 | **Manual override** | Force ON, Force OFF, or return to AUTO mode |
 | **Uptime & RSSI** | Device uptime and WiFi signal strength |
+| **Duration / Distance** | Set light duration (s) and per-sensor presence distance (mm), persisted to NVS |
 | **JSON API** | `GET /api` returns machine-readable JSON |
 | **Override API** | `GET /api/override?mode=on\|off\|auto` for programmatic control |
+| **Distance API** | `POST /api/distance?position=bottom\|top&mm=N` to set a presence threshold |
 | **Auto-refresh** | Dashboard polls every 2 seconds |
 
 ### API Examples
@@ -60,6 +67,16 @@ curl "http://192.168.1.42/api/override?mode=on"
 # Return to automatic mode
 curl "http://192.168.1.42/api/override?mode=auto"
 # → {"override":"auto","lights_on":false}
+
+# Set light duration (seconds)
+curl -X POST "http://192.168.1.42/api/duration?seconds=120"
+# → {"duration_sec":120,"active_duration_sec":120,"persisted":true,"ok":true}
+
+# Set presence distance thresholds (mm, 150–2000)
+curl -X POST "http://192.168.1.42/api/distance?position=bottom&mm=1000"
+# → {"position":"bottom","distance_mm":1000,"ok":true}
+curl -X POST "http://192.168.1.42/api/distance?position=top&mm=800"
+# → {"position":"top","distance_mm":800,"ok":true}
 ```
 
 ## Hardware
@@ -117,9 +134,14 @@ Edit `config.h` before flashing:
 #define LONGITUDE       -99.1332
 #define TIMEZONE        "America/Mexico_City"
 #define LUX_THRESHOLD   30         // Lux below this = "dark"
-#define VL53L0X_PRESENCE_MM  1200  // Distance (mm) below which = person detected
+#define VL53L0X_MIN_PRESENCE_MM 150  // 15cm — minimum sensing range (ghost-reading floor)
+#define DISTANCE_DEFAULT_MM  1200    // Default presence distance (configurable via dashboard)
 #define DEFAULT_LIGHT_DURATION_SEC  90  // Seconds to keep lights on after detection
 ```
+
+The presence distance (bottom and top, independently) and light duration can
+also be changed live from the dashboard — values are persisted to NVS and
+survive reboot. Allowed presence distance range: **150–2000 mm**.
 
 ## Build & Flash
 
