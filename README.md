@@ -13,7 +13,7 @@ Any condition false ────────────────▶ LIGHTS O
 ```
 
 **Decision logic:**
-1. **VL53L0X ToF** (bottom of stairs) measures distance via laser — detects presence within a configurable range (3–7cm)
+1. **VL53L0X ToF** (bottom of stairs) measures distance via laser — detects presence within a configurable range (3–15cm, default 7cm)
 2. **VL53L0X ToF** (top of stairs) — same, for the upper landing (independent threshold)
 3. **BH1750** measures ambient light (lux) — ensures lights don't fire during daytime
 4. **sunrise-sunset.org API** provides sunset time for your location — lights only at night
@@ -22,7 +22,7 @@ Any condition false ────────────────▶ LIGHTS O
 
 Presence is only registered when the measured distance is **≥ 3cm** (ignores
 VL53L0X ghost/crosstalk readings near 0mm) **and below the per-sensor threshold**.
-The measure range is **3cm to 7cm**. The ToF/BH1750 sensors are polled every
+The presence threshold is configurable **3cm to 15cm** (default 7cm). The ToF/BH1750 sensors are polled every
 **5s by default** (configurable via dashboard/API) so the web server stays
 instantly responsive while the lasers sample on that cadence.
 
@@ -74,7 +74,7 @@ curl "http://192.168.1.42/api/override?mode=auto"
 curl -X POST "http://192.168.1.42/api/duration?seconds=120"
 # → {"duration_sec":120,"active_duration_sec":120,"persisted":true,"ok":true}
 
-# Set presence distance thresholds (mm, 30–70)
+# Set presence distance thresholds (mm, 30–150)
 curl -X POST "http://192.168.1.42/api/distance?position=bottom&mm=60"
 # → {"position":"bottom","distance_mm":60,"ok":true}
 curl -X POST "http://192.168.1.42/api/distance?position=top&mm=50"
@@ -148,8 +148,8 @@ Edit `config.h` before flashing:
 
 The presence distance (bottom and top, independently), light duration, and
 sensor polling interval can all be changed live from the dashboard — values are
-persisted to NVS and survive reboot. Allowed presence distance range: **30–70 mm**
-(3–7cm). Polling interval range: **1–300 s** (default 5s).
+persisted to NVS and survive reboot. Allowed presence distance range: **30–150 mm**
+(3–15cm). Polling interval range: **1–300 s** (default 5s).
 
 ## Build & Flash
 

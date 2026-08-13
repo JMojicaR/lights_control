@@ -37,11 +37,11 @@
 #define VL53L0X_ADDR_DEFAULT  0x29  // Default I²C address (sensor 0 — bottom)
 #define VL53L0X_ADDR_ALT      0x30  // Alternate address for second sensor (top)
 // Presence detection window (mm): distance >= MIN and distance < threshold → person detected
-// Measure range: 3cm to 7cm (30–70mm)
+// Measure range: 3cm floor, threshold configurable up to 15cm
 #define VL53L0X_MIN_PRESENCE_MM  30    // 3cm — readings below this are ignored (ghost/crosstalk)
 #define DISTANCE_DEFAULT_MM      70    // Default presence distance threshold (7cm), configurable via HTTP
 #define DISTANCE_MIN_MM          30    // Shortest allowed presence distance (3cm)
-#define DISTANCE_MAX_MM          70    // Longest allowed presence distance (7cm)
+#define DISTANCE_MAX_MM          150   // Longest allowed presence distance (15cm)
 // Range status: 0=valid, other=out-of-range or error
 #define VL53L0X_TIMING_BUDGET_MS  33  // 33ms = standard speed (~1.2m range)
 

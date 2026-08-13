@@ -743,12 +743,12 @@ void handleRoot() {
 
   <div class="duration-row">
     <label for="distBottomInput">📏 Bottom (mm):</label>
-    <input type="number" id="distBottomInput" min="30" max="70" step="1" value="70">
+    <input type="number" id="distBottomInput" min="30" max="150" step="1" value="70">
     <button class="btn btn-sm" onclick="setDistance('bottom')">Set</button>
   </div>
   <div class="duration-row">
     <label for="distTopInput">📏 Top (mm):</label>
-    <input type="number" id="distTopInput" min="30" max="70" step="1" value="70">
+    <input type="number" id="distTopInput" min="30" max="150" step="1" value="70">
     <button class="btn btn-sm" onclick="setDistance('top')">Set</button>
   </div>
 
