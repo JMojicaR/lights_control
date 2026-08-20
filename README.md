@@ -17,7 +17,7 @@ Any condition false ────────────────▶ LIGHTS O
 2. **VL53L0X ToF** (top of stairs) — same, for the upper landing (independent threshold)
 3. **BH1750** measures ambient light (lux) — ensures lights don't fire during daytime
 4. **sunrise-sunset.org API** provides sunset time for your location — lights only at night
-5. Lights stay ON for a configurable duration (default 90s) after last detection, then turn OFF
+5. Lights stay ON for a configurable duration (default 90s) after turning on, then turn OFF — presence polling pauses while the lights are on, so the countdown isn't reset by continued presence on the stairs
 6. **Manual override** via web dashboard — force ON / OFF / AUTO
 
 Presence is only registered when the measured distance is **≥ 3cm** (ignores

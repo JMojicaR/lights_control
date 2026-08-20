@@ -8,7 +8,8 @@
  *   3. Time of day vs sunset (HTTP APIs)
  *
  * Lights turn ON when: person detected on stairs AND it's dark AND past sunset.
- * Lights stay ON for a configurable duration (default 90s) after last detection.
+ * Lights stay ON for a configurable duration (default 90s) after turning on;
+ * presence polling pauses while ON so the countdown isn't reset by continued presence.
  *
  * VL53L0X advantages over HC-SR501 PIR:
  *   - Detects presence even when person is still (no movement needed)
@@ -480,7 +481,14 @@ void readSensors() {
     unsigned long now = millis();
     bool sessionWasActive = (presenceBottom || presenceTop);
 
-    if (tofReady) {
+    // ── Pause presence polling while lights are ON ──
+    // Once the lights turn on, stop reading the ToF sensors. Re-reading them
+    // here would refresh lastMotionTime on every poll (a person still on the
+    // stairs keeps pinning "remaining time" at the full duration, so the lights
+    // never time out). Skipping these reads lets the countdown run to zero and
+    // the presence-timeout below switches the lights off after the fixed duration.
+    // Reading resumes on the next poll after the lights go off.
+    if (tofReady && !lightsOn) {
         // VL53L0X bottom — read distance
         distanceBottom = tofBottom.readRangeSingleMillimeters();
         if (!tofBottom.timeoutOccurred()) {
