@@ -3,15 +3,20 @@
  * ===============================================
  *
  * Automatically controls a 12V LED strip on a 5m staircase based on:
- *   1. Motion detection (HC-SR501 PIR)
+ *   1. Presence detection (VL53L0X ToF laser distance sensors)
  *   2. Ambient light level (BH1750 I²C lux sensor)
  *   3. Time of day vs sunset (HTTP APIs)
  *
- * Lights turn ON when: motion detected AND it's dark AND past sunset.
- * Lights stay ON for a configurable duration (default 120s) after last motion,
+ * Lights turn ON when: person detected on stairs AND it's dark AND past sunset.
+ * Lights stay ON for a configurable duration (default 90s) after last detection.
+ *
+ * VL53L0X advantages over HC-SR501 PIR:
+ *   - Detects presence even when person is still (no movement needed)
+ *   - Works in hot environments (PIR fails when ambient ≈ body temp)
+ *   - Provides actual distance in mm for richer dashboard data
  *
  * Web Dashboard: http://<esp32-ip>/
- *   - Live status: lux, motion, lights, time, sunset
+ *   - Live status: lux, distance (cm), lights, time, sunset
  *   - Manual override: force ON / OFF / AUTO
  *
  * APIs used:
@@ -20,9 +25,9 @@
  *
  * Hardware:
  *   - ESP32-S3 SuperMini
- *   - HC-SR501 PIR motion sensor — bottom of stairs (GPIO 4)
- *   - HC-SR501 PIR motion sensor — top of stairs (GPIO 6)
- *   - BH1750 ambient light sensor (I²C: SDA 21, SCL 22)
+ *   - VL53L0X ToF distance sensor — bottom of stairs (I²C addr 0x29, XSHUT GPIO 4)
+ *   - VL53L0X ToF distance sensor — top of stairs (I²C addr 0x30, XSHUT GPIO 6)
+ *   - BH1750 ambient light sensor (I²C: SDA 12, SCL 13)
  *   - IRLZ44N MOSFET switching 12V LED strip (GPIO 5)
  *   - 12V DC power supply (≥6A for 5m strip)
  */
@@ -32,6 +37,7 @@
 #include <HTTPClient.h>
 #include <Wire.h>
 #include <BH1750.h>
+#include <VL53L0X.h>
 #include <ArduinoJson.h>
 #include <WebServer.h>
 #include <time.h>
@@ -39,11 +45,16 @@
 
 // ── Objects ─────────────────────────────────────
 BH1750 lightMeter;
+VL53L0X tofBottom;   // Bottom of stairs (I²C addr 0x29)
+VL53L0X tofTop;      // Top of stairs (I²C addr 0x30)
 WebServer server(80);
 Preferences prefs;
 
 const char* PREF_NAMESPACE = "stairs";
 const char* PREF_KEY_DURATION = "dur_sec";
+const char* PREF_KEY_DIST_BOTTOM = "dist_bottom_mm";
+const char* PREF_KEY_DIST_TOP = "dist_top_mm";
+const char* PREF_KEY_POLL = "poll_sec";
 
 // ── Time tracking ───────────────────────────────
 unsigned long lastTimeSync   = 0;      // millis() of last HTTP time sync
@@ -57,9 +68,12 @@ int           localUtcOffsetSec = -6 * 3600; // Updated from time API (Mexico Ci
 const unsigned long TIME_RESYNC_MS   = TIME_RESYNC_MIN  * 60000UL;
 const unsigned long SUNSET_RESYNC_MS = SUNSET_RESYNC_MIN * 60000UL;
 
-// ── Motion tracking ─────────────────────────────
-bool     motionActiveBottom = false;
-bool     motionActiveTop    = false;
+// ── Presence tracking (VL53L0X) ──────────────────
+bool     presenceBottom  = false;
+bool     presenceTop     = false;
+uint16_t distanceBottom  = 0;        // mm
+uint16_t distanceTop     = 0;        // mm
+bool     tofReady        = false;    // At least one sensor initialized
 unsigned long lastMotionTime = 0;
 unsigned long motionDebounceUntil = 0;
 
@@ -75,6 +89,13 @@ unsigned long fadeStartMs = 0;    // When the current fade began
 // ── Dynamic light duration (changeable via HTTP) ─
 unsigned long configuredDurationSec = DEFAULT_LIGHT_DURATION_SEC; // Used for new sessions
 unsigned long activeDurationSec     = DEFAULT_LIGHT_DURATION_SEC; // Locked for current session
+
+// ── Dynamic presence distance thresholds (changeable via HTTP) ─
+unsigned long configuredDistanceBottomMm = DISTANCE_DEFAULT_MM;  // bottom sensor presence threshold
+unsigned long configuredDistanceTopMm    = DISTANCE_DEFAULT_MM;  // top sensor presence threshold
+
+// ── Dynamic sensor polling interval (changeable via HTTP) ─
+unsigned long configuredPollIntervalSec = POLL_INTERVAL_DEFAULT_SEC;  // seconds between sensor reads
 
 // ── Manual override ─────────────────────────────
 //  0 = AUTO (use sensor/sunset logic)
@@ -96,43 +117,104 @@ void setup() {
     delay(250);
     Serial.println("\n=== Staircase Light Controller ===\n");
 
-    // Load persisted configured duration (fallback to compile-time default).
+    // Load persisted settings (fallback to compile-time defaults).
     if (prefs.begin(PREF_NAMESPACE, true)) {
-      unsigned long saved = prefs.getULong(PREF_KEY_DURATION, DEFAULT_LIGHT_DURATION_SEC);
+      unsigned long savedDur = prefs.getULong(PREF_KEY_DURATION, DEFAULT_LIGHT_DURATION_SEC);
+      unsigned long savedBottom = prefs.getULong(PREF_KEY_DIST_BOTTOM, DISTANCE_DEFAULT_MM);
+      unsigned long savedTop = prefs.getULong(PREF_KEY_DIST_TOP, DISTANCE_DEFAULT_MM);
+      unsigned long savedPoll = prefs.getULong(PREF_KEY_POLL, POLL_INTERVAL_DEFAULT_SEC);
       prefs.end();
 
-      if (saved >= DURATION_MIN_SEC && saved <= DURATION_MAX_SEC) {
-        configuredDurationSec = saved;
+      if (savedDur >= DURATION_MIN_SEC && savedDur <= DURATION_MAX_SEC) {
+        configuredDurationSec = savedDur;
       } else {
         configuredDurationSec = DEFAULT_LIGHT_DURATION_SEC;
         Serial.printf("[⚠] Stored duration invalid (%lu) — using default %lu\n",
-                saved, configuredDurationSec);
+                savedDur, configuredDurationSec);
       }
+
+      configuredDistanceBottomMm = (savedBottom >= DISTANCE_MIN_MM && savedBottom <= DISTANCE_MAX_MM)
+                                   ? savedBottom : DISTANCE_DEFAULT_MM;
+      configuredDistanceTopMm    = (savedTop >= DISTANCE_MIN_MM && savedTop <= DISTANCE_MAX_MM)
+                                   ? savedTop : DISTANCE_DEFAULT_MM;
+      configuredPollIntervalSec  = (savedPoll >= POLL_INTERVAL_MIN_SEC && savedPoll <= POLL_INTERVAL_MAX_SEC)
+                                   ? savedPoll : POLL_INTERVAL_DEFAULT_SEC;
     } else {
       configuredDurationSec = DEFAULT_LIGHT_DURATION_SEC;
       Serial.printf("[⚠] Preferences unavailable — using default duration %lu\n",
               configuredDurationSec);
     }
     activeDurationSec = configuredDurationSec;
-    Serial.printf("[⚙] Configured duration loaded: %lus\n", configuredDurationSec);
+    Serial.printf("[⚙] Loaded: duration %lus | dist bottom %lumm | dist top %lumm | poll %lus\n",
+                  configuredDurationSec, configuredDistanceBottomMm,
+                  configuredDistanceTopMm, configuredPollIntervalSec);
 
     // Pins — LED MOSFET uses PWM for fade
-    pinMode(PIR_PIN_BOTTOM, INPUT);
-    pinMode(PIR_PIN_TOP, INPUT);
     pinMode(STATUS_LED_PIN, OUTPUT);
     digitalWrite(STATUS_LED_PIN, LOW);
 
-    // PWM setup for LED MOSFET (8-bit, 5 kHz — silent, smooth fade)
-    ledcAttach(LED_MOSFET_PIN, PWM_FREQ, PWM_RES);
-    ledcWrite(LED_MOSFET_PIN, 0);
-
-    // I²C for BH1750
+    // I²C for BH1750 + VL53L0X (shared bus)
     Wire.begin(I2C_SDA, I2C_SCL);
+
+    // ── VL53L0X ToF sensor init (two sensors on same I²C bus) ──
+    // Strategy: hold both in shutdown, then wake one at a time. The FIRST
+    // sensor woken MUST be moved off the default 0x29 address before the
+    // second wakes — otherwise both boot at 0x29 and a setAddress() write
+    // hits both (address collision → constant 65535 readings).
+    pinMode(VL53L0X_XSHUT_BOTTOM, OUTPUT);
+    pinMode(VL53L0X_XSHUT_TOP, OUTPUT);
+    digitalWrite(VL53L0X_XSHUT_BOTTOM, LOW);  // Hold both in shutdown
+    digitalWrite(VL53L0X_XSHUT_TOP, LOW);
+    delay(10);
+
+    // Init TOP first: wake it at 0x29, then move it to the alternate address
+    // (0x30) so the default 0x29 is free for the bottom sensor.
+    digitalWrite(VL53L0X_XSHUT_TOP, HIGH);
+    delay(10);
+    if (tofTop.init(true)) {  // true = use 2.8V mode (more stable)
+        tofTop.setAddress(VL53L0X_ADDR_ALT);
+        tofTop.setTimeout(500);
+        tofTop.setMeasurementTimingBudget(VL53L0X_TIMING_BUDGET_MS * 1000UL);
+        Serial.printf("[✓] VL53L0X top ready (addr 0x%02X)\n", tofTop.getAddress());
+        tofReady = true;
+    } else {
+        Serial.println("[✗] VL53L0X top not found — check wiring");
+    }
+
+    // Init BOTTOM second: it boots at the default 0x29, now free.
+    digitalWrite(VL53L0X_XSHUT_BOTTOM, HIGH);
+    delay(10);
+    if (tofBottom.init(true)) {
+        tofBottom.setAddress(VL53L0X_ADDR_DEFAULT);
+        tofBottom.setTimeout(500);
+        tofBottom.setMeasurementTimingBudget(VL53L0X_TIMING_BUDGET_MS * 1000UL);
+        Serial.printf("[✓] VL53L0X bottom ready (addr 0x%02X)\n", tofBottom.getAddress());
+        tofReady = true;
+    } else {
+        Serial.println("[✗] VL53L0X bottom not found — check wiring");
+    }
+
+    // ── Post-init reachability check ──
+    // Verify each sensor actually answers at its assigned address. This catches
+    // an address collision (a sensor silently moved to the wrong address would
+    // otherwise read as a constant 65535).
+    if (tofBottom.readReg(VL53L0X::IDENTIFICATION_MODEL_ID) != 0xEE) {
+        Serial.println("[⚠] Bottom sensor not reachable at 0x29 — possible address collision");
+    }
+    if (tofTop.readReg(VL53L0X::IDENTIFICATION_MODEL_ID) != 0xEE) {
+        Serial.println("[⚠] Top sensor not reachable at 0x30 — possible address collision");
+    }
+
+    // BH1750 lux sensor init
     if (!lightMeter.begin(LIGHT_SENSOR_MODE, 0x23, &Wire)) {
         Serial.println("[✗] BH1750 not found — check wiring");
     } else {
         Serial.println("[✓] BH1750 ready");
     }
+
+    // PWM setup for LED MOSFET (8-bit, 5 kHz — silent, smooth fade)
+    ledcAttach(LED_MOSFET_PIN, PWM_FREQ, PWM_RES);
+    ledcWrite(LED_MOSFET_PIN, 0);
 
     // WiFi
     connectWiFi();
@@ -146,6 +228,8 @@ void setup() {
     server.on("/api", handleAPI);
     server.on("/api/override", handleOverride);
     server.on("/api/duration", handleDuration);
+    server.on("/api/distance", handleDistance);
+    server.on("/api/poll", handlePoll);
     server.onNotFound([]() {
         server.send(404, "application/json", "{\"error\":\"not found\"}");
     });
@@ -160,7 +244,7 @@ void setup() {
 // LOOP
 // ─────────────────────────────────────────────────
 void loop() {
-    server.handleClient();  // non-blocking — serves web requests
+    server.handleClient();  // non-blocking — serves web requests (runs every loop)
 
     unsigned long now = millis();
 
@@ -174,17 +258,25 @@ void loop() {
         syncSunset();
     }
 
-    // ── Read sensors ─────────────────────────────
-    readSensors();
+    // ── Sensor polling (configurable interval, default 5s) ──
+    // The ToF/BH1750 sensors are read on this cadence while the web server stays
+    // fully responsive.
+    static unsigned long lastSensorPoll = 0;
+    unsigned long pollIntervalMs = configuredPollIntervalSec * 1000UL;
+    if (lastSensorPoll == 0 || now - lastSensorPoll >= pollIntervalMs) {
+        lastSensorPoll = now;
+        readSensors();
+    }
 
-    // ── Decision logic ───────────────────────────
-    bool shouldLight = evaluate();
+    // ── Decision logic + light control (every loop — keeps override responsive) ──
+    setLights(evaluate());
 
-    // ── Control lights ───────────────────────────
-    setLights(shouldLight);
-
-    // ── PWM fade tick (non-blocking, steps each loop) ──
-    updateFade();
+    // ── PWM fade tick (fixed cadence → smooth fade regardless of polling) ──
+    static unsigned long lastFadeTick = 0;
+    if (now - lastFadeTick >= FADE_TICK_MS) {
+        lastFadeTick = now;
+        updateFade();
+    }
 
     // ── Status LED heartbeat ─────────────────────
     digitalWrite(STATUS_LED_PIN, lightsOn ? HIGH : (now / 1000) % 2);
@@ -196,7 +288,7 @@ void loop() {
         printStatus();
     }
 
-    delay(SENSOR_POLL_MS);
+    delay(LOOP_DELAY_MS);
 }
 
 // ═════════════════════════════════════════════════
@@ -397,48 +489,58 @@ void syncSunset() {
 }
 
 // ═════════════════════════════════════════════════
-// Sensors
+// Sensors — VL53L0X ToF + BH1750
 // ═════════════════════════════════════════════════
 void readSensors() {
     unsigned long now = millis();
-  bool sessionWasActive = (motionActiveBottom || motionActiveTop);
+    bool sessionWasActive = (presenceBottom || presenceTop);
 
-    // PIR — bottom of stairs
-    int pirBottom = digitalRead(PIR_PIN_BOTTOM);
-    if (pirBottom == HIGH && now >= motionDebounceUntil) {
-        if (!motionActiveBottom) {
-            Serial.println("[👣] Motion detected — bottom!");
+    if (tofReady) {
+        // VL53L0X bottom — read distance
+        distanceBottom = tofBottom.readRangeSingleMillimeters();
+        if (!tofBottom.timeoutOccurred()) {
+            bool inRange = (distanceBottom >= VL53L0X_MIN_PRESENCE_MM &&
+                            distanceBottom < configuredDistanceBottomMm);
+            if (inRange && now >= motionDebounceUntil) {
+                if (!presenceBottom) {
+                    Serial.printf("[👣] Presence detected — bottom! (%u mm)\n", distanceBottom);
+                }
+                presenceBottom = true;
+                lastMotionTime = now;
+                motionDebounceUntil = now + MOTION_DEBOUNCE_MS;
+            }
         }
-        motionActiveBottom = true;
-        lastMotionTime = now;
-        motionDebounceUntil = now + MOTION_DEBOUNCE_MS;
+
+        // VL53L0X top — read distance
+        distanceTop = tofTop.readRangeSingleMillimeters();
+        if (!tofTop.timeoutOccurred()) {
+            bool inRange = (distanceTop >= VL53L0X_MIN_PRESENCE_MM &&
+                            distanceTop < configuredDistanceTopMm);
+            if (inRange && now >= motionDebounceUntil) {
+                if (!presenceTop) {
+                    Serial.printf("[👣] Presence detected — top! (%u mm)\n", distanceTop);
+                }
+                presenceTop = true;
+                lastMotionTime = now;
+                motionDebounceUntil = now + MOTION_DEBOUNCE_MS;
+            }
+        }
     }
 
-    // PIR — top of stairs
-    int pirTop = digitalRead(PIR_PIN_TOP);
-    if (pirTop == HIGH && now >= motionDebounceUntil) {
-        if (!motionActiveTop) {
-            Serial.println("[👣] Motion detected — top!");
-        }
-        motionActiveTop = true;
-        lastMotionTime = now;
-        motionDebounceUntil = now + MOTION_DEBOUNCE_MS;
-    }
-
-    // Start a new motion session only when transitioning from idle -> active.
-    bool sessionNowActive = (motionActiveBottom || motionActiveTop);
+    // Start a new presence session only when transitioning from idle -> active.
+    bool sessionNowActive = (presenceBottom || presenceTop);
     if (!sessionWasActive && sessionNowActive) {
       activeDurationSec = configuredDurationSec;
-      Serial.printf("[⏱] New motion session — duration locked at %lus\n", activeDurationSec);
+      Serial.printf("[⏱] New presence session — duration locked at %lus\n", activeDurationSec);
     }
 
-    // Motion timeout: clear both PIR states when no motion for duration
-    bool anyMotion = (motionActiveBottom || motionActiveTop);
-    if (anyMotion && (now - lastMotionTime > activeDurationSec * 1000UL)) {
-        if (motionActiveBottom) Serial.println("[👣] Motion timeout — bottom");
-        if (motionActiveTop)    Serial.println("[👣] Motion timeout — top");
-        motionActiveBottom = false;
-        motionActiveTop    = false;
+    // Presence timeout: clear both when no presence for duration
+    bool anyPresence = (presenceBottom || presenceTop);
+    if (anyPresence && (now - lastMotionTime > activeDurationSec * 1000UL)) {
+        if (presenceBottom) Serial.println("[👣] Presence timeout — bottom");
+        if (presenceTop)    Serial.println("[👣] Presence timeout — top");
+        presenceBottom = false;
+        presenceTop    = false;
     }
 
     // BH1750 — ambient light (lux)
@@ -473,17 +575,17 @@ bool evaluate() {
     // Between sunrise and sunset = daytime → no lights needed
     bool isNight = (nowEpoch >= sunsetEpoch || nowEpoch < sunriseEpoch);
 
-    // Condition 3: Was motion recently detected by either PIR?
-    bool hasMotion = (motionActiveBottom || motionActiveTop);
+    // Condition 3: Was presence recently detected by either ToF sensor?
+    bool hasMotion = (presenceBottom || presenceTop);
 
     // Decision table:
-    //   motion + dark + night → ON
+    //   presence + dark + night → ON
     //   anything else → OFF
     bool shouldLight = hasMotion && isDim && isNight;
 
     static bool lastDecision = false;
     if (shouldLight != lastDecision) {
-        Serial.printf("[💡] Decision: %s  (motion=%d dark=%d night=%d lux=%.0f)\n",
+        Serial.printf("[💡] Decision: %s  (presence=%d dark=%d night=%d lux=%.0f)\n",
                       shouldLight ? "ON" : "OFF", hasMotion, isDim, isNight, lux);
         lastDecision = shouldLight;
     }
@@ -552,23 +654,26 @@ void printStatus() {
     char sunsetStr[16];
   formatHHMMFromEpoch(sunsetEpoch, localUtcOffsetSec, sunsetStr, sizeof(sunsetStr));
 
-    Serial.printf("[STATUS] %s | Lux: %.0f | Motion bottom: %s | Motion top: %s | Lights: %s", 
+    Serial.printf("[STATUS] %s | Lux: %.0f | Bottom: %s (%umm) | Top: %s (%umm) | Lights: %s", 
                   timeStr, lux,
-                  motionActiveBottom ? "YES" : "no",
-                  motionActiveTop ? "YES" : "no",
+                  presenceBottom ? "PRESENT" : "clear", distanceBottom,
+                  presenceTop ? "PRESENT" : "clear", distanceTop,
                   currentDuty > 0 ? "ON" : "OFF");
 
-    // Remaining time when lights are on
-    if (currentDuty > 0 && (motionActiveBottom || motionActiveTop)) {
-        unsigned long remaining = activeDurationSec - ((millis() - lastMotionTime) / 1000);
-        Serial.printf(" | Remaining: %lus", remaining);
+    // Remaining time when lights are on (clamped — avoids unsigned underflow)
+    if (currentDuty > 0 && (presenceBottom || presenceTop)) {
+        long remaining = (long)activeDurationSec - (long)((millis() - lastMotionTime) / 1000);
+        if (remaining < 0) remaining = 0;
+        Serial.printf(" | Remaining: %lds", remaining);
     }
 
-      Serial.printf(" | Sunset: %s | Mode: %s | Duration(set): %lus | Duration(active): %lus\n",
+      Serial.printf(" | Sunset: %s | Mode: %s | Duration(set): %lus | Duration(active): %lus | Dist B/T: %lu/%lumm\n",
                   sunsetStr,
                   overrideMode == 1 ? "FORCE ON" : (overrideMode == -1 ? "FORCE OFF" : "AUTO"),
               configuredDurationSec,
-              activeDurationSec);
+              activeDurationSec,
+              configuredDistanceBottomMm,
+              configuredDistanceTopMm);
 }
 
 // ═════════════════════════════════════════════════
@@ -600,6 +705,7 @@ void handleRoot() {
   .tile .value{font-size:1.5rem;font-weight:700;line-height:1.2}
   .lux .value{color:#38bdf8}
   .motion .value{color:#a78bfa}
+  .motion.active .value{color:#f87171}
   .sunset .value{color:#fb923c}
   .time .value{color:#e2e8f0}
   .remaining .value{color:#34d399}
@@ -637,13 +743,13 @@ void handleRoot() {
       <div class="label">☀️ Ambient Light</div>
       <div class="value" id="lux">--</div>
     </div>
-    <div class="tile motion" id="motionTileB">
-      <div class="label">👣 Motion Bottom</div>
-      <div class="value" id="motionB">--</div>
+    <div class="tile motion" id="sensorTileB">
+      <div class="label">📏 Distance Bottom</div>
+      <div class="value" id="distB">--</div>
     </div>
-    <div class="tile motion" id="motionTileT">
-      <div class="label">👣 Motion Top</div>
-      <div class="value" id="motionT">--</div>
+    <div class="tile motion" id="sensorTileT">
+      <div class="label">📏 Distance Top</div>
+      <div class="value" id="distT">--</div>
     </div>
     <div class="tile time">
       <div class="label">🕐 Local Time</div>
@@ -665,6 +771,23 @@ void handleRoot() {
     <button class="btn btn-sm" onclick="setDuration()">Set</button>
   </div>
 
+  <div class="duration-row">
+    <label for="distBottomInput">📏 Bottom (mm):</label>
+    <input type="number" id="distBottomInput" min="30" max="150" step="1" value="70">
+    <button class="btn btn-sm" onclick="setDistance('bottom')">Set</button>
+  </div>
+  <div class="duration-row">
+    <label for="distTopInput">📏 Top (mm):</label>
+    <input type="number" id="distTopInput" min="30" max="150" step="1" value="70">
+    <button class="btn btn-sm" onclick="setDistance('top')">Set</button>
+  </div>
+
+  <div class="duration-row">
+    <label for="pollInput">⏲ Poll (s):</label>
+    <input type="number" id="pollInput" min="1" max="300" step="1" value="5">
+    <button class="btn btn-sm" onclick="setPoll()">Set</button>
+  </div>
+
   <div class="btn-row">
     <button class="btn force-on" id="btnOn" onclick="setOverride('on')">🔆 Force ON</button>
     <button class="btn active" id="btnAuto" onclick="setOverride('auto')">🔄 Auto</button>
@@ -681,11 +804,11 @@ const ip = window.location.host;
 document.getElementById('ip').textContent = 'http://' + ip + '/';
 
 let currentOverride = 'auto';
-let durationEditing = false;
 
 const durInputEl = document.getElementById('durInput');
-durInputEl.addEventListener('focus', () => { durationEditing = true; });
-durInputEl.addEventListener('blur', () => { durationEditing = false; });
+const distBottomEl = document.getElementById('distBottomInput');
+const distTopEl = document.getElementById('distTopInput');
+const pollInputEl = document.getElementById('pollInput');
 
 async function fetchData() {
   try {
@@ -708,26 +831,34 @@ async function fetchData() {
     // Lux
     document.getElementById('lux').innerHTML = d.lux.toFixed(0) + ' <small style="font-size:.65rem;opacity:.6">lux</small>';
 
-    // Motion — bottom
-    const mTileB = document.getElementById('motionTileB');
-    const mMetricB = document.getElementById('motionB');
-    if (d.motion_bottom) {
-      mTileB.className = 'tile motion active';
-      mMetricB.textContent = 'Active';
+    // Distance — bottom
+    const sTileB = document.getElementById('sensorTileB');
+    const sMetricB = document.getElementById('distB');
+    const distB_cm = d.distance_bottom_mm ? (d.distance_bottom_mm / 10).toFixed(0) : '--';
+    if (d.presence_bottom) {
+      sTileB.className = 'tile motion active';
+      sMetricB.innerHTML = distB_cm + ' <small style="font-size:.65rem;opacity:.6">cm · PRESENT</small>';
+    } else if (d.distance_bottom_mm > 0) {
+      sTileB.className = 'tile motion';
+      sMetricB.innerHTML = distB_cm + ' <small style="font-size:.65rem;opacity:.6">cm · clear</small>';
     } else {
-      mTileB.className = 'tile motion';
-      mMetricB.textContent = 'Idle';
+      sTileB.className = 'tile motion';
+      sMetricB.textContent = '--';
     }
 
-    // Motion — top
-    const mTileT = document.getElementById('motionTileT');
-    const mMetricT = document.getElementById('motionT');
-    if (d.motion_top) {
-      mTileT.className = 'tile motion active';
-      mMetricT.textContent = 'Active';
+    // Distance — top
+    const sTileT = document.getElementById('sensorTileT');
+    const sMetricT = document.getElementById('distT');
+    const distT_cm = d.distance_top_mm ? (d.distance_top_mm / 10).toFixed(0) : '--';
+    if (d.presence_top) {
+      sTileT.className = 'tile motion active';
+      sMetricT.innerHTML = distT_cm + ' <small style="font-size:.65rem;opacity:.6">cm · PRESENT</small>';
+    } else if (d.distance_top_mm > 0) {
+      sTileT.className = 'tile motion';
+      sMetricT.innerHTML = distT_cm + ' <small style="font-size:.65rem;opacity:.6">cm · clear</small>';
     } else {
-      mTileT.className = 'tile motion';
-      mMetricT.textContent = 'Idle';
+      sTileT.className = 'tile motion';
+      sMetricT.textContent = '--';
     }
 
     // Time
@@ -756,9 +887,18 @@ async function fetchData() {
       remTile.className = 'tile remaining';
     }
 
-    // Duration: do not overwrite user draft while editing.
-    if (!durationEditing) {
-      document.getElementById('durInput').value = d.duration_sec;
+    // Settings inputs: only refresh values that aren't being actively edited.
+    if (document.activeElement !== durInputEl) {
+      durInputEl.value = d.duration_sec;
+    }
+    if (document.activeElement !== distBottomEl) {
+      distBottomEl.value = d.distance_bottom_mm_set;
+    }
+    if (document.activeElement !== distTopEl) {
+      distTopEl.value = d.distance_top_mm_set;
+    }
+    if (document.activeElement !== pollInputEl) {
+      pollInputEl.value = d.poll_interval_sec;
     }
 
     // Uptime
@@ -803,6 +943,39 @@ async function setDuration() {
   }
 }
 
+async function setDistance(position) {
+  const el = (position === 'bottom')
+    ? document.getElementById('distBottomInput')
+    : document.getElementById('distTopInput');
+  const mm = el.value;
+  try {
+    const r = await fetch('/api/distance?position=' + position + '&mm=' + mm, {method:'POST'});
+    const d = await r.json();
+    if (d.ok) {
+      el.value = d.distance_mm;
+    } else if (d.error) {
+      alert(d.error);
+    }
+  } catch(e) {
+    console.error('Distance error:', e);
+  }
+}
+
+async function setPoll() {
+  const secs = pollInputEl.value;
+  try {
+    const r = await fetch('/api/poll?seconds=' + secs, {method:'POST'});
+    const d = await r.json();
+    if (d.ok) {
+      pollInputEl.value = d.poll_interval_sec;
+    } else if (d.error) {
+      alert(d.error);
+    }
+  } catch(e) {
+    console.error('Poll error:', e);
+  }
+}
+
 fetchData();
 setInterval(fetchData, 2000);
 </script>
@@ -840,7 +1013,7 @@ void handleAPI() {
 
     // Compute remaining time (seconds) when lights are on
     long remainingSec = 0;
-    if (currentDuty > 0 && (motionActiveBottom || motionActiveTop)) {
+    if (currentDuty > 0 && (presenceBottom || presenceTop)) {
         long elapsed = (millis() - lastMotionTime) / 1000;
       remainingSec = (long)activeDurationSec - elapsed;
         if (remainingSec < 0) remainingSec = 0;
@@ -854,8 +1027,12 @@ void handleAPI() {
     json += "\"lights_on\":" + String(currentDuty > 0 ? "true" : "false") + ",";
     json += "\"duty\":" + String(currentDuty) + ",";
     json += "\"lux\":" + String(lux, 1) + ",";
-    json += "\"motion_bottom\":" + String(motionActiveBottom ? "true" : "false") + ",";
-    json += "\"motion_top\":" + String(motionActiveTop ? "true" : "false") + ",";
+    json += "\"presence_bottom\":" + String(presenceBottom ? "true" : "false") + ",";
+    json += "\"presence_top\":" + String(presenceTop ? "true" : "false") + ",";
+    json += "\"distance_bottom_mm\":" + String(distanceBottom) + ",";
+    json += "\"distance_top_mm\":" + String(distanceTop) + ",";
+    json += "\"distance_bottom_mm_set\":" + String(configuredDistanceBottomMm) + ",";
+    json += "\"distance_top_mm_set\":" + String(configuredDistanceTopMm) + ",";
     json += "\"time\":\"" + String(timeStr) + "\",";
     json += "\"sunset\":\"" + String(sunsetStr) + "\",";
     json += "\"override\":\"" + String(overrideStr) + "\",";
@@ -864,6 +1041,7 @@ void handleAPI() {
     json += "\"ip\":\"" + WiFi.localIP().toString() + "\",";
     json += "\"duration_sec\":" + String(configuredDurationSec) + ",";
     json += "\"active_duration_sec\":" + String(activeDurationSec) + ",";
+    json += "\"poll_interval_sec\":" + String(configuredPollIntervalSec) + ",";
     json += "\"remaining_sec\":" + String(remainingSec);
     json += "}";
 
@@ -950,6 +1128,100 @@ void handleDuration() {
         snprintf(resp, sizeof(resp),
              "{\"duration_sec\":%lu,\"active_duration_sec\":%lu}",
              configuredDurationSec, activeDurationSec);
+        server.send(200, "application/json", resp);
+    }
+}
+
+// ═════════════════════════════════════════════════
+// Distance endpoint — /api/distance
+//   GET  → returns current presence distance thresholds (mm)
+//   POST ?position=bottom|top&mm=N → sets threshold (clamped)
+// ═════════════════════════════════════════════════
+void handleDistance() {
+    String position = server.arg("position");
+    position.toLowerCase();
+    bool isBottom = (position == "bottom");
+    bool isTop    = (position == "top");
+    if (!isBottom && !isTop) {
+        server.send(400, "application/json",
+                    "{\"error\":\"missing ?position=bottom|top\"}");
+        return;
+    }
+
+    if (server.method() == HTTP_POST || server.hasArg("mm")) {
+        long newDist = server.arg("mm").toInt();
+        if (newDist < DISTANCE_MIN_MM || newDist > DISTANCE_MAX_MM) {
+            char err[128];
+            snprintf(err, sizeof(err),
+                     "{\"error\":\"distance must be %d–%d mm\"}",
+                     DISTANCE_MIN_MM, DISTANCE_MAX_MM);
+            server.send(400, "application/json", err);
+            return;
+        }
+
+        if (isBottom) configuredDistanceBottomMm = (unsigned long)newDist;
+        else          configuredDistanceTopMm    = (unsigned long)newDist;
+
+        Serial.printf("[⚙] Distance %s set to %lumm (HTTP)\n",
+                      isBottom ? "bottom" : "top",
+                      isBottom ? configuredDistanceBottomMm : configuredDistanceTopMm);
+
+        if (prefs.begin(PREF_NAMESPACE, false)) {
+            prefs.putULong(PREF_KEY_DIST_BOTTOM, configuredDistanceBottomMm);
+            prefs.putULong(PREF_KEY_DIST_TOP, configuredDistanceTopMm);
+            prefs.end();
+        }
+
+        char resp[160];
+        snprintf(resp, sizeof(resp),
+                 "{\"position\":\"%s\",\"distance_mm\":%lu,\"ok\":true}",
+                 isBottom ? "bottom" : "top",
+                 isBottom ? configuredDistanceBottomMm : configuredDistanceTopMm);
+        server.send(200, "application/json", resp);
+    } else {
+        char resp[160];
+        snprintf(resp, sizeof(resp),
+                 "{\"distance_bottom_mm\":%lu,\"distance_top_mm\":%lu}",
+                 configuredDistanceBottomMm, configuredDistanceTopMm);
+        server.send(200, "application/json", resp);
+    }
+}
+
+// ═════════════════════════════════════════════════
+// Poll interval endpoint — /api/poll
+//   GET  → returns current sensor polling interval (seconds)
+//   POST ?seconds=N → sets interval (clamped)
+// ═════════════════════════════════════════════════
+void handlePoll() {
+    if (server.method() == HTTP_POST || server.hasArg("seconds")) {
+        long newPoll = server.arg("seconds").toInt();
+        if (newPoll < POLL_INTERVAL_MIN_SEC || newPoll > POLL_INTERVAL_MAX_SEC) {
+            char err[128];
+            snprintf(err, sizeof(err),
+                     "{\"error\":\"poll interval must be %d–%d seconds\"}",
+                     POLL_INTERVAL_MIN_SEC, POLL_INTERVAL_MAX_SEC);
+            server.send(400, "application/json", err);
+            return;
+        }
+
+        configuredPollIntervalSec = (unsigned long)newPoll;
+        Serial.printf("[⚙] Poll interval set to %lus (HTTP)\n", configuredPollIntervalSec);
+
+        if (prefs.begin(PREF_NAMESPACE, false)) {
+            prefs.putULong(PREF_KEY_POLL, configuredPollIntervalSec);
+            prefs.end();
+        }
+
+        char resp[128];
+        snprintf(resp, sizeof(resp),
+                 "{\"poll_interval_sec\":%lu,\"ok\":true}",
+                 configuredPollIntervalSec);
+        server.send(200, "application/json", resp);
+    } else {
+        char resp[128];
+        snprintf(resp, sizeof(resp),
+                 "{\"poll_interval_sec\":%lu}",
+                 configuredPollIntervalSec);
         server.send(200, "application/json", resp);
     }
 }

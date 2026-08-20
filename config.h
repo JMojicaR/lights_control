@@ -30,12 +30,12 @@
 #define SUNSET_API_URL  "https://api.sunrise-sunset.org/json"
 
 // ── Pins ────────────────────────────────────────
-#define PIR_PIN_BOTTOM   4       // HC-SR501 PIR at bottom of stairs (digital)
-#define PIR_PIN_TOP      6       // HC-SR501 PIR at top of stairs (digital)
-#define LED_MOSFET_PIN   5       // IRLZ44N gate for 12V LED strip
-#define STATUS_LED_PIN   2       // Built-in LED (2 = most ESP32-S3 SuperMini)
+#define VL53L0X_XSHUT_BOTTOM  4   // VL53L0X ToF sensor at bottom of stairs (XSHUT pin)
+#define VL53L0X_XSHUT_TOP     6   // VL53L0X ToF sensor at top of stairs (XSHUT pin)
+#define LED_MOSFET_PIN        5   // IRLZ44N gate for 12V LED strip
+#define STATUS_LED_PIN        2   // Built-in LED (2 = most ESP32-S3 SuperMini)
 
-// BH1750 uses I²C (default pins on ESP32-S3 SuperMini)
+// BH1750 + VL53L0X share I²C (default pins on ESP32-S3 SuperMini)
 #define I2C_SDA         12
 #define I2C_SCL         13
 
@@ -43,10 +43,26 @@
 #define LUX_THRESHOLD       30    // Lux below this = "dark enough" for lights
 #define DEFAULT_LIGHT_DURATION_SEC  90  // Keep lights ON this many seconds after last motion (default, changeable via HTTP)
 #define MOTION_DEBOUNCE_MS          2000  // Ignore motion re-triggers within this window
-#define PIR_RETRIGGER       false // HC-SR501: false = single trigger, true = repeat
+
+// ── VL53L0X ToF Sensor Settings ──────────────────
+// VL53L0X I²C addresses (when using two sensors on same bus)
+#define VL53L0X_ADDR_DEFAULT  0x29  // Default I²C address (sensor 0 — bottom)
+#define VL53L0X_ADDR_ALT      0x30  // Alternate address for second sensor (top)
+// Presence detection window (mm): distance >= MIN and distance < threshold → person detected
+// Measure range: 3cm floor, threshold configurable up to 15cm
+#define VL53L0X_MIN_PRESENCE_MM  30    // 3cm — readings below this are ignored (ghost/crosstalk)
+#define DISTANCE_DEFAULT_MM      70    // Default presence distance threshold (7cm), configurable via HTTP
+#define DISTANCE_MIN_MM          30    // Shortest allowed presence distance (3cm)
+#define DISTANCE_MAX_MM          150   // Longest allowed presence distance (15cm)
+// Range status: 0=valid, other=out-of-range or error
+#define VL53L0X_TIMING_BUDGET_MS  33  // 33ms = standard speed (~1.2m range)
 
 // ── Timing ──────────────────────────────────────
-#define SENSOR_POLL_MS      250   // How often to read sensors (milliseconds)
+#define POLL_INTERVAL_DEFAULT_SEC  5    // Default sensor polling interval (seconds), configurable via HTTP
+#define POLL_INTERVAL_MIN_SEC      1    // Shortest allowed polling interval
+#define POLL_INTERVAL_MAX_SEC      300  // Longest allowed polling interval (5 min)
+#define FADE_TICK_MS            250   // PWM fade step interval (keeps fade smooth regardless of polling)
+#define LOOP_DELAY_MS           10    // Base loop delay — keeps web server + heartbeat responsive
 #define TIME_RESYNC_MIN     60    // Re-sync time from HTTP every N minutes
 #define SUNSET_RESYNC_MIN   360   // Re-sync sunset from HTTP every 6 hours
 
