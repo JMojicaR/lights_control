@@ -17,14 +17,20 @@ Any condition false ────────────────▶ LIGHTS O
 2. **VL53L0X ToF** (top of stairs) — same, for the upper landing (independent threshold)
 3. **BH1750** measures ambient light (lux) — ensures lights don't fire during daytime
 4. **sunrise-sunset.org API** provides sunset time for your location — lights only at night
-5. Lights stay ON for a configurable duration (default 90s) after last detection, then turn OFF
+5. Lights stay ON for a configurable duration (default 90s) after turning on, then turn OFF — the presence interrupt is disarmed while the lights are on, so continued presence on the stairs can't reset the countdown
 6. **Manual override** via web dashboard — force ON / OFF / AUTO
 
-Presence is only registered when the measured distance is **≥ 3cm** (ignores
-VL53L0X ghost/crosstalk readings near 0mm) **and below the per-sensor threshold**.
-The presence threshold is configurable **3cm to 15cm** (default 7cm). The ToF/BH1750 sensors are polled every
-**5s by default** (configurable via dashboard/API) so the web server stays
-instantly responsive while the lasers sample on that cadence.
+Presence is detected by **hardware interrupt, not polling**. Each VL53L0X's
+GPIO1 pin is configured as an active-low threshold interrupt that fires the
+moment the measured distance drops below the per-sensor threshold. The ESP32
+attaches an interrupt handler that registers presence and turns the lights on.
+
+The interrupt is **armed only after sunset and while the lights are OFF** — it is
+disarmed while the lights are on (so the countdown runs to completion) and
+re-armed when they go off. Ghost/crosstalk readings below 3cm are still filtered
+out, and the presence threshold is configurable **3cm to 15cm** (default 7cm).
+The ambient-light BH1750 sensor is still polled (**5s by default**, configurable),
+since lux changes slowly.
 
 ### Why VL53L0X instead of PIR?
 
@@ -35,7 +41,7 @@ instantly responsive while the lasers sample on that cadence.
 | Hot environments | ❌ Fails (ambient ≈ body temp) | ✅ Works |
 | Output | Binary (HIGH/LOW) | Distance in mm |
 | Range | ~5m cone | Up to 2m (reliable ~1.2m) |
-| Interface | Single digital pin | I²C (shared bus) |
+| Interface | Single digital pin | I²C (shared bus) + GPIO1 interrupt output |
 | Multi-sensor | 1 pin each | XSHUT pin + unique I²C address |
 
 ## Web Dashboard
@@ -47,11 +53,11 @@ Open `http://<esp32-ip>/` in any browser on the same network.
 | **Live status** | Lights ON/OFF, ambient lux, distance (cm) bottom/top, local time, sunset |
 | **Manual override** | Force ON, Force OFF, or return to AUTO mode |
 | **Uptime & RSSI** | Device uptime and WiFi signal strength |
-| **Duration / Distance / Poll** | Set light duration (s), per-sensor presence distance (mm), and sensor polling interval (s), persisted to NVS |
+| **Duration / Distance / Poll** | Set light duration (s), per-sensor presence distance (mm), and ambient-light (BH1750) polling interval (s), persisted to NVS |
 | **JSON API** | `GET /api` returns machine-readable JSON |
 | **Override API** | `GET /api/override?mode=on\|off\|auto` for programmatic control |
 | **Distance API** | `POST /api/distance?position=bottom\|top&mm=N` to set a presence threshold |
-| **Poll API** | `POST /api/poll?seconds=N` to set the sensor polling interval |
+| **Poll API** | `POST /api/poll?seconds=N` to set the ambient-light polling interval |
 | **Auto-refresh** | Dashboard polls every 2 seconds |
 
 ### API Examples
@@ -90,8 +96,8 @@ curl -X POST "http://192.168.1.42/api/poll?seconds=10"
 | Component | Purpose | GPIO / I²C |
 |-----------|---------|------|
 | ESP32-S3 SuperMini | Controller | — |
-| VL53L0X ToF (bottom) | Presence detection (bottom of stairs) | I²C addr 0x29, XSHUT GPIO 4 |
-| VL53L0X ToF (top) | Presence detection (top of stairs) | I²C addr 0x30, XSHUT GPIO 6 |
+| VL53L0X ToF (bottom) | Presence detection (bottom of stairs) | I²C addr 0x29, XSHUT GPIO 4, IRQ GPIO 7 |
+| VL53L0X ToF (top) | Presence detection (top of stairs) | I²C addr 0x30, XSHUT GPIO 6, IRQ GPIO 8 |
 | BH1750 | Ambient light sensor | I²C 0x23 (SDA 12, SCL 13) |
 | IRLZ44N MOSFET | Switch 12V LED strip | 5 (PWM-capable) |
 | 12V LED strip (5m) | Staircase lighting | MOSFET drain |
@@ -104,12 +110,17 @@ ESP32-S3              Peripheral
 ────────              ──────────
 GPIO 4   ──────────── VL53L0X #1 XSHUT (bottom)
 GPIO 6   ──────────── VL53L0X #2 XSHUT (top)
+GPIO 7   ──────────── VL53L0X #1 GPIO1 (bottom, interrupt out)
+GPIO 8   ──────────── VL53L0X #2 GPIO1 (top, interrupt out)
 GPIO 12  ──────────── VL53L0X #1 SDA, VL53L0X #2 SDA, BH1750 SDA
 GPIO 13  ──────────── VL53L0X #1 SCL, VL53L0X #2 SCL, BH1750 SCL
 3.3V    ──────────── VL53L0X VIN (×2), BH1750 VCC
 GND     ──────────── VL53L0X GND (×2), BH1750 GND
 
 VL53L0X XSHUT pins must have 10KΩ pull-up to 3.3V (many modules include this).
+GPIO1 is the sensor's active-low interrupt output — wire it to the ESP32 IRQ pin
+listed above (a 10KΩ pull-up to 3.3V is harmless, and required if your module's
+GPIO1 is open-drain).
 All three I²C devices share the same SDA/SCL bus — unique addresses assigned at boot.
 
 MOSFET circuit:
@@ -143,13 +154,15 @@ Edit `config.h` before flashing:
 #define VL53L0X_MIN_PRESENCE_MM 30   // 3cm — minimum sensing range (ghost-reading floor)
 #define DISTANCE_DEFAULT_MM  70      // 7cm — default presence distance (configurable via dashboard)
 #define DEFAULT_LIGHT_DURATION_SEC  90  // Seconds to keep lights on after detection
-#define POLL_INTERVAL_DEFAULT_SEC 5  // Sensor polling interval (configurable via dashboard)
+#define VL53L0X_IRQ_BOTTOM  7        // Bottom sensor GPIO1 (interrupt out) → ESP32 GPIO 7
+#define VL53L0X_IRQ_TOP     8        // Top sensor GPIO1 (interrupt out)    → ESP32 GPIO 8
+#define POLL_INTERVAL_DEFAULT_SEC 5  // Ambient-light (BH1750) polling interval (configurable via dashboard)
 ```
 
 The presence distance (bottom and top, independently), light duration, and
-sensor polling interval can all be changed live from the dashboard — values are
-persisted to NVS and survive reboot. Allowed presence distance range: **30–150 mm**
-(3–15cm). Polling interval range: **1–300 s** (default 5s).
+ambient-light polling interval can all be changed live from the dashboard — values
+are persisted to NVS and survive reboot. Allowed presence distance range: **30–150 mm**
+(3–15cm). Lux polling interval range: **1–300 s** (default 5s).
 
 ## Build & Flash
 
@@ -175,6 +188,8 @@ arduino-cli monitor -p /dev/ttyUSB0 -c baudrate=115200
 === Staircase Light Controller ===
 [✓] VL53L0X bottom ready (addr 0x29)
 [✓] VL53L0X top ready (addr 0x30)
+[🔔] Bottom sensor → interrupt on GPIO 7 (threshold 70mm)
+[🔔] Top sensor → interrupt on GPIO 8 (threshold 70mm)
 [✓] BH1750 ready
 [✓] WiFi connected — IP: 192.168.1.42
 [⏰] Time synced: 2026-07-10T16:19:26-06:00 (UTC-6, DST=no)
@@ -182,9 +197,11 @@ arduino-cli monitor -p /dev/ttyUSB0 -c baudrate=115200
 [🌐] Dashboard: http://192.168.1.42/
 --- Ready ---
 [STATUS] 14:30:15 | Lux: 450 | Bottom: clear (2100mm) | Top: clear (2050mm) | Lights: OFF | Sunset: 19:15 | Mode: AUTO
+[🔔] Presence interrupts armed
 [👣] Presence detected — bottom! (450 mm)
 [💡] Decision: ON  (presence=1 dark=1 night=1 lux=3)
 [💡] Lights → ON (fading in)
+[🔕] Presence interrupts disarmed
 ```
 
 ## Dependencies (Arduino Libraries)
