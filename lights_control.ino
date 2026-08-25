@@ -414,6 +414,25 @@ void formatHHMMSSFromEpoch(time_t epochUtc, int utcOffsetSec, char* out, size_t 
   strftime(out, outSize, "%H:%M:%S", &tmUtc);
 }
 
+// Local minutes-since-midnight for a UTC epoch (0..1439).
+// Time-of-day comparisons are immune to the calendar-date offset between UTC
+// and local time (a western timezone's sunset lands on the *next* UTC date).
+int minutesOfDay(time_t epochUtc, int utcOffsetSec) {
+  time_t localEpoch = epochUtc + utcOffsetSec;
+  struct tm tmUtc = {};
+  gmtime_r(&localEpoch, &tmUtc);
+  return tmUtc.tm_hour * 60 + tmUtc.tm_min;
+}
+
+// Local calendar date (YYYY-MM-DD) for a UTC epoch — used to request today's
+// sunrise/sunset from the API instead of letting it default to the UTC date.
+void formatLocalDate(time_t epochUtc, int utcOffsetSec, char* out, size_t outSize) {
+  time_t localEpoch = epochUtc + utcOffsetSec;
+  struct tm tmUtc = {};
+  gmtime_r(&localEpoch, &tmUtc);
+  strftime(out, outSize, "%Y-%m-%d", &tmUtc);
+}
+
 // ═════════════════════════════════════════════════
 // HTTP: Sync current time from timeapi.io
 // ═════════════════════════════════════════════════
@@ -478,6 +497,17 @@ void syncSunset() {
                  "?lat=" + String(LATITUDE, 4) +
                  "&lng=" + String(LONGITUDE, 4) +
                  "&formatted=0";  // return ISO 8601 UTC
+
+    // Request today's LOCAL date explicitly. Without this the API defaults to
+    // the current UTC date — for a UTC-6 timezone the local evening is already
+    // the *next* UTC day, so it would return tomorrow's sunrise/sunset and the
+    // night check would fire before sunset.
+    if (timeValid) {
+        char localDate[16];
+        formatLocalDate(currentEpoch, localUtcOffsetSec, localDate, sizeof(localDate));
+        url += "&date=" + String(localDate);
+    }
+
     http.begin(url);
     http.setTimeout(8000);
 
@@ -605,10 +635,17 @@ void readLux() {
 }
 
 // ── Night check (after sunset OR before sunrise) ──
+// Compares local times-of-day rather than absolute epochs. Absolute-epoch
+// comparison is fragile because sunrise/sunset are reported in UTC, so a
+// western timezone's sunset lands on the NEXT UTC date — "now < sunrise" then
+// stays true during the daytime and the lights come on before sunset.
 bool isNightNow() {
     if (!timeValid || !sunsetValid) return false;
     time_t nowEpoch = currentEpoch + ((millis() - lastTimeSync) / 1000);
-    return (nowEpoch >= sunsetEpoch || nowEpoch < sunriseEpoch);
+    int nowMin     = minutesOfDay(nowEpoch,     localUtcOffsetSec);
+    int sunriseMin = minutesOfDay(sunriseEpoch, localUtcOffsetSec);
+    int sunsetMin  = minutesOfDay(sunsetEpoch,  localUtcOffsetSec);
+    return (nowMin >= sunsetMin) || (nowMin < sunriseMin);
 }
 
 // ── Arm / disarm presence interrupts ──
@@ -669,15 +706,12 @@ bool evaluate() {
         return false;
     }
 
-    // Advance the internal clock by elapsed millis
-    time_t nowEpoch = currentEpoch + ((millis() - lastTimeSync) / 1000);
-
     // Condition 1: Is it dark enough?
     bool isDim = (lux >= 0 && lux < LUX_THRESHOLD);
 
     // Condition 2: Is it after sunset OR before sunrise?
     // Between sunrise and sunset = daytime → no lights needed
-    bool isNight = (nowEpoch >= sunsetEpoch || nowEpoch < sunriseEpoch);
+    bool isNight = isNightNow();
 
     // Condition 3: Was presence recently detected by either ToF sensor?
     bool hasMotion = (presenceBottom || presenceTop);
