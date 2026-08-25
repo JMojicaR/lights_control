@@ -596,7 +596,6 @@ void handleTofInterrupt(VL53L0X &sensor, bool &presenceFlag,
 
 // ── Consume latched interrupt flags (called every loop) ──
 void processTofInterrupts() {
-    unsigned long now = millis();
     bool sessionWasActive = (presenceBottom || presenceTop);
 
     if (irqBottomTriggered) {
@@ -618,7 +617,11 @@ void processTofInterrupts() {
     }
 
     // Presence timeout: clear both when no presence for the configured duration.
-    if ((presenceBottom || presenceTop) && (now - lastMotionTime > activeDurationSec * 1000UL)) {
+    // Use a fresh millis() here — the value captured at function entry would
+    // predate the lastMotionTime update made inside handleTofInterrupt(), so
+    // subtracting it underflows (unsigned) and clears presence the very instant
+    // it is detected.
+    if ((presenceBottom || presenceTop) && (millis() - lastMotionTime > activeDurationSec * 1000UL)) {
         if (presenceBottom) Serial.println("[👣] Presence timeout — bottom");
         if (presenceTop)    Serial.println("[👣] Presence timeout — top");
         presenceBottom = false;
