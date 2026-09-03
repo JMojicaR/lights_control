@@ -8,7 +8,10 @@
  *   3. Time of day vs sunset (HTTP APIs)
  *
  * Lights turn ON when: person detected on stairs AND it's dark AND past sunset.
- * Lights stay ON for a configurable duration (default 90s) after last detection.
+ * Presence is detected via VL53L0X hardware interrupts (GPIO1 threshold output),
+ * not polling. Interrupts are armed only after sunset and while the lights are
+ * OFF; they are disarmed while the lights are ON and re-armed when they go off,
+ * so the countdown is never reset by continued presence on the stairs.
  *
  * VL53L0X advantages over HC-SR501 PIR:
  *   - Detects presence even when person is still (no movement needed)
@@ -25,8 +28,8 @@
  *
  * Hardware:
  *   - ESP32-S3 SuperMini
- *   - VL53L0X ToF distance sensor — bottom of stairs (I²C addr 0x29, XSHUT GPIO 4)
- *   - VL53L0X ToF distance sensor — top of stairs (I²C addr 0x30, XSHUT GPIO 6)
+ *   - VL53L0X ToF distance sensor — bottom of stairs (I²C addr 0x29, XSHUT GPIO 4, IRQ GPIO 7)
+ *   - VL53L0X ToF distance sensor — top of stairs (I²C addr 0x30, XSHUT GPIO 6, IRQ GPIO 8)
  *   - BH1750 ambient light sensor (I²C: SDA 12, SCL 13)
  *   - IRLZ44N MOSFET switching 12V LED strip (GPIO 5)
  *   - 12V DC power supply (≥6A for 5m strip)
@@ -73,7 +76,13 @@ bool     presenceBottom  = false;
 bool     presenceTop     = false;
 uint16_t distanceBottom  = 0;        // mm
 uint16_t distanceTop     = 0;        // mm
-bool     tofReady        = false;    // At least one sensor initialized
+bool     tofBottomReady  = false;    // Bottom sensor initialized
+bool     tofTopReady     = false;    // Top sensor initialized
+
+// ── Interrupt-driven presence (VL53L0X GPIO1) ────
+volatile bool irqBottomTriggered = false;  // Set by bottom-sensor ISR
+volatile bool irqTopTriggered    = false;  // Set by top-sensor ISR
+bool     interruptsArmed  = false;   // True while presence interrupts are attached
 unsigned long lastMotionTime = 0;
 unsigned long motionDebounceUntil = 0;
 
@@ -176,7 +185,7 @@ void setup() {
         tofTop.setTimeout(500);
         tofTop.setMeasurementTimingBudget(VL53L0X_TIMING_BUDGET_MS * 1000UL);
         Serial.printf("[✓] VL53L0X top ready (addr 0x%02X)\n", tofTop.getAddress());
-        tofReady = true;
+        tofTopReady = true;
     } else {
         Serial.println("[✗] VL53L0X top not found — check wiring");
     }
@@ -189,7 +198,7 @@ void setup() {
         tofBottom.setTimeout(500);
         tofBottom.setMeasurementTimingBudget(VL53L0X_TIMING_BUDGET_MS * 1000UL);
         Serial.printf("[✓] VL53L0X bottom ready (addr 0x%02X)\n", tofBottom.getAddress());
-        tofReady = true;
+        tofBottomReady = true;
     } else {
         Serial.println("[✗] VL53L0X bottom not found — check wiring");
     }
@@ -203,6 +212,25 @@ void setup() {
     }
     if (tofTop.readReg(VL53L0X::IDENTIFICATION_MODEL_ID) != 0xEE) {
         Serial.println("[⚠] Top sensor not reachable at 0x30 — possible address collision");
+    }
+
+    // ── Configure VL53L0X GPIO1 as a presence interrupt ──
+    // Each sensor's GPIO1 pin is set to fire (active LOW) whenever the measured
+    // distance drops below the presence threshold, then continuous ranging is
+    // started. Detection is now interrupt-driven — no polling loop.
+    if (tofBottomReady) {
+        configureToFInterrupt(tofBottom, configuredDistanceBottomMm);
+        tofBottom.startContinuous(VL53L0X_INTERMEASUREMENT_MS);
+        pinMode(VL53L0X_IRQ_BOTTOM, INPUT_PULLUP);
+        Serial.printf("[🔔] Bottom sensor → interrupt on GPIO %d (threshold %lumm)\n",
+                      VL53L0X_IRQ_BOTTOM, configuredDistanceBottomMm);
+    }
+    if (tofTopReady) {
+        configureToFInterrupt(tofTop, configuredDistanceTopMm);
+        tofTop.startContinuous(VL53L0X_INTERMEASUREMENT_MS);
+        pinMode(VL53L0X_IRQ_TOP, INPUT_PULLUP);
+        Serial.printf("[🔔] Top sensor → interrupt on GPIO %d (threshold %lumm)\n",
+                      VL53L0X_IRQ_TOP, configuredDistanceTopMm);
     }
 
     // BH1750 lux sensor init
@@ -258,18 +286,27 @@ void loop() {
         syncSunset();
     }
 
-    // ── Sensor polling (configurable interval, default 5s) ──
-    // The ToF/BH1750 sensors are read on this cadence while the web server stays
-    // fully responsive.
-    static unsigned long lastSensorPoll = 0;
-    unsigned long pollIntervalMs = configuredPollIntervalSec * 1000UL;
-    if (lastSensorPoll == 0 || now - lastSensorPoll >= pollIntervalMs) {
-        lastSensorPoll = now;
-        readSensors();
+    // ── ToF presence (interrupt-driven) + presence timeout ──
+    // VL53L0X presence is handled by hardware interrupts, not polling. The ISRs
+    // latch flags that are consumed here; the presence timeout (turn the lights
+    // off after the configured duration) also runs every loop.
+    processTofInterrupts();
+
+    // ── Ambient light (BH1750) polling (configurable interval, default 5s) ──
+    // The ToF sensors no longer need polling; only the lux sensor is read on a
+    // cadence, keeping the web server fully responsive.
+    static unsigned long lastLuxPoll = 0;
+    unsigned long luxPollMs = configuredPollIntervalSec * 1000UL;
+    if (lastLuxPoll == 0 || now - lastLuxPoll >= luxPollMs) {
+        lastLuxPoll = now;
+        readLux();
     }
 
     // ── Decision logic + light control (every loop — keeps override responsive) ──
     setLights(evaluate());
+
+    // ── Arm/disarm presence interrupts based on time + light state ──
+    updateInterrupts();
 
     // ── PWM fade tick (fixed cadence → smooth fade regardless of polling) ──
     static unsigned long lastFadeTick = 0;
@@ -392,6 +429,25 @@ void formatHHMMSSFromEpoch(time_t epochUtc, int utcOffsetSec, char* out, size_t 
   strftime(out, outSize, "%H:%M:%S", &tmUtc);
 }
 
+// Local minutes-since-midnight for a UTC epoch (0..1439).
+// Time-of-day comparisons are immune to the calendar-date offset between UTC
+// and local time (a western timezone's sunset lands on the *next* UTC date).
+int minutesOfDay(time_t epochUtc, int utcOffsetSec) {
+  time_t localEpoch = epochUtc + utcOffsetSec;
+  struct tm tmUtc = {};
+  gmtime_r(&localEpoch, &tmUtc);
+  return tmUtc.tm_hour * 60 + tmUtc.tm_min;
+}
+
+// Local calendar date (YYYY-MM-DD) for a UTC epoch — used to request today's
+// sunrise/sunset from the API instead of letting it default to the UTC date.
+void formatLocalDate(time_t epochUtc, int utcOffsetSec, char* out, size_t outSize) {
+  time_t localEpoch = epochUtc + utcOffsetSec;
+  struct tm tmUtc = {};
+  gmtime_r(&localEpoch, &tmUtc);
+  strftime(out, outSize, "%Y-%m-%d", &tmUtc);
+}
+
 // ═════════════════════════════════════════════════
 // HTTP: Sync current time from timeapi.io
 // ═════════════════════════════════════════════════
@@ -456,6 +512,17 @@ void syncSunset() {
                  "?lat=" + String(LATITUDE, 4) +
                  "&lng=" + String(LONGITUDE, 4) +
                  "&formatted=0";  // return ISO 8601 UTC
+
+    // Request today's LOCAL date explicitly. Without this the API defaults to
+    // the current UTC date — for a UTC-6 timezone the local evening is already
+    // the *next* UTC day, so it would return tomorrow's sunrise/sunset and the
+    // night check would fire before sunset.
+    if (timeValid) {
+        char localDate[16];
+        formatLocalDate(currentEpoch, localUtcOffsetSec, localDate, sizeof(localDate));
+        url += "&date=" + String(localDate);
+    }
+
     http.begin(url);
     http.setTimeout(8000);
 
@@ -489,64 +556,156 @@ void syncSunset() {
 }
 
 // ═════════════════════════════════════════════════
-// Sensors — VL53L0X ToF + BH1750
+// Sensors — VL53L0X ToF (interrupt-driven) + BH1750
 // ═════════════════════════════════════════════════
-void readSensors() {
+
+// ── VL53L0X interrupt ISRs (run on falling edge of GPIO1) ──
+// Active-low interrupt: the sensor pulls GPIO1 LOW when the distance drops below
+// the presence threshold. Keep these tiny — they only latch a flag; the I²C read
+// that fetches the actual range happens in the main loop.
+void IRAM_ATTR onTofBottomIrq() { irqBottomTriggered = true; }
+void IRAM_ATTR onTofTopIrq()    { irqTopTriggered    = true; }
+
+// ── Configure a VL53L0X to fire GPIO1 when distance < threshold ──
+// Writes the low-distance threshold and sets GPIO1 to "interrupt on range below
+// low threshold" (active LOW). Register semantics follow the ST VL53L0X API:
+//   * SYSTEM_THRESH_LOW / HIGH are the distance thresholds (the firmware applies
+//     a x2 to the stored value, so we store mm/2).
+//   * SYSTEM_INTERRUPT_CONFIG_GPIO = 0x01 → THRESHOLD_CROSSED_LOW functionality.
+//   * GPIO_HV_MUX_ACTIVE_HIGH bit 4 cleared → active-low polarity.
+void applyToFThreshold(VL53L0X &sensor, unsigned long thresholdMm) {
+    uint16_t low = (uint16_t)(thresholdMm / 2);
+    sensor.writeReg16Bit(VL53L0X::SYSTEM_THRESH_LOW,  low);
+    sensor.writeReg16Bit(VL53L0X::SYSTEM_THRESH_HIGH, 0);   // high threshold disabled
+}
+
+void configureToFInterrupt(VL53L0X &sensor, unsigned long thresholdMm) {
+    applyToFThreshold(sensor, thresholdMm);
+    sensor.writeReg(VL53L0X::SYSTEM_INTERRUPT_CONFIG_GPIO, 0x01); // THRESHOLD_CROSSED_LOW
+    uint8_t hv = sensor.readReg(VL53L0X::GPIO_HV_MUX_ACTIVE_HIGH);
+    sensor.writeReg(VL53L0X::GPIO_HV_MUX_ACTIVE_HIGH, hv & 0xEF); // active-low (clear bit 4)
+    sensor.writeReg(VL53L0X::SYSTEM_INTERRUPT_CLEAR, 0x01);       // clear any pending IRQ
+}
+
+// ── Handle a single ToF interrupt ──
+// Reads the range that triggered the interrupt, re-arms the sensor, and updates
+// presence state. Ghost/crosstalk readings below VL53L0X_MIN_PRESENCE_MM are
+// ignored (the same floor the old polling code enforced).
+void handleTofInterrupt(VL53L0X &sensor, bool &presenceFlag,
+                        uint16_t &distance, unsigned long thresholdMm,
+                        const char* name) {
+    distance = sensor.readReg16Bit(VL53L0X::RESULT_RANGE_STATUS + 10);
+    sensor.writeReg(VL53L0X::SYSTEM_INTERRUPT_CLEAR, 0x01);  // re-arm for next crossing
+
     unsigned long now = millis();
+    bool inRange = (distance >= VL53L0X_MIN_PRESENCE_MM && distance < thresholdMm);
+    if (inRange && now >= motionDebounceUntil) {
+        if (!presenceFlag) {
+            Serial.printf("[👣] Presence detected — %s! (%u mm)\n", name, distance);
+        }
+        presenceFlag = true;
+        lastMotionTime = now;
+        motionDebounceUntil = now + MOTION_DEBOUNCE_MS;
+    }
+}
+
+// ── Consume latched interrupt flags (called every loop) ──
+void processTofInterrupts() {
     bool sessionWasActive = (presenceBottom || presenceTop);
 
-    if (tofReady) {
-        // VL53L0X bottom — read distance
-        distanceBottom = tofBottom.readRangeSingleMillimeters();
-        if (!tofBottom.timeoutOccurred()) {
-            bool inRange = (distanceBottom >= VL53L0X_MIN_PRESENCE_MM &&
-                            distanceBottom < configuredDistanceBottomMm);
-            if (inRange && now >= motionDebounceUntil) {
-                if (!presenceBottom) {
-                    Serial.printf("[👣] Presence detected — bottom! (%u mm)\n", distanceBottom);
-                }
-                presenceBottom = true;
-                lastMotionTime = now;
-                motionDebounceUntil = now + MOTION_DEBOUNCE_MS;
-            }
-        }
-
-        // VL53L0X top — read distance
-        distanceTop = tofTop.readRangeSingleMillimeters();
-        if (!tofTop.timeoutOccurred()) {
-            bool inRange = (distanceTop >= VL53L0X_MIN_PRESENCE_MM &&
-                            distanceTop < configuredDistanceTopMm);
-            if (inRange && now >= motionDebounceUntil) {
-                if (!presenceTop) {
-                    Serial.printf("[👣] Presence detected — top! (%u mm)\n", distanceTop);
-                }
-                presenceTop = true;
-                lastMotionTime = now;
-                motionDebounceUntil = now + MOTION_DEBOUNCE_MS;
-            }
-        }
+    if (irqBottomTriggered) {
+        irqBottomTriggered = false;
+        handleTofInterrupt(tofBottom, presenceBottom, distanceBottom,
+                           configuredDistanceBottomMm, "bottom");
+    }
+    if (irqTopTriggered) {
+        irqTopTriggered = false;
+        handleTofInterrupt(tofTop, presenceTop, distanceTop,
+                           configuredDistanceTopMm, "top");
     }
 
-    // Start a new presence session only when transitioning from idle -> active.
+    // Lock the light duration on the idle -> active transition.
     bool sessionNowActive = (presenceBottom || presenceTop);
     if (!sessionWasActive && sessionNowActive) {
-      activeDurationSec = configuredDurationSec;
-      Serial.printf("[⏱] New presence session — duration locked at %lus\n", activeDurationSec);
+        activeDurationSec = configuredDurationSec;
+        Serial.printf("[⏱] New presence session — duration locked at %lus\n", activeDurationSec);
     }
 
-    // Presence timeout: clear both when no presence for duration
-    bool anyPresence = (presenceBottom || presenceTop);
-    if (anyPresence && (now - lastMotionTime > activeDurationSec * 1000UL)) {
+    // Presence timeout: clear both when no presence for the configured duration.
+    // Use a fresh millis() here — the value captured at function entry would
+    // predate the lastMotionTime update made inside handleTofInterrupt(), so
+    // subtracting it underflows (unsigned) and clears presence the very instant
+    // it is detected.
+    if ((presenceBottom || presenceTop) && (millis() - lastMotionTime > activeDurationSec * 1000UL)) {
         if (presenceBottom) Serial.println("[👣] Presence timeout — bottom");
         if (presenceTop)    Serial.println("[👣] Presence timeout — top");
         presenceBottom = false;
         presenceTop    = false;
     }
+}
 
-    // BH1750 — ambient light (lux)
+// ── Ambient light (BH1750) — still polled (lux changes slowly) ──
+void readLux() {
     if (lightMeter.measurementReady()) {
         lux = lightMeter.readLightLevel();
         if (lux < 0) lux = 0;
+    }
+}
+
+// ── Night check (after sunset OR before sunrise) ──
+// Compares local times-of-day rather than absolute epochs. Absolute-epoch
+// comparison is fragile because sunrise/sunset are reported in UTC, so a
+// western timezone's sunset lands on the NEXT UTC date — "now < sunrise" then
+// stays true during the daytime and the lights come on before sunset.
+bool isNightNow() {
+    if (!timeValid || !sunsetValid) return false;
+    time_t nowEpoch = currentEpoch + ((millis() - lastTimeSync) / 1000);
+    int nowMin     = minutesOfDay(nowEpoch,     localUtcOffsetSec);
+    int sunriseMin = minutesOfDay(sunriseEpoch, localUtcOffsetSec);
+    int sunsetMin  = minutesOfDay(sunsetEpoch,  localUtcOffsetSec);
+    return (nowMin >= sunsetMin) || (nowMin < sunriseMin);
+}
+
+// ── Arm / disarm presence interrupts ──
+// Interrupts are armed only when it is night AND the lights are OFF AND the unit
+// is in AUTO mode. While the lights are ON (or during the day) the interrupts are
+// detached, so continued presence on the stairs can't reset the countdown — the
+// lights time out after the configured duration and the interrupt is re-armed.
+void armInterrupts() {
+    if (interruptsArmed) return;
+    irqBottomTriggered = false;
+    irqTopTriggered    = false;
+
+    if (tofBottomReady) {
+        tofBottom.writeReg(VL53L0X::SYSTEM_INTERRUPT_CLEAR, 0x01);  // clear stale latch
+        attachInterrupt(digitalPinToInterrupt(VL53L0X_IRQ_BOTTOM), onTofBottomIrq, FALLING);
+        if (digitalRead(VL53L0X_IRQ_BOTTOM) == LOW) irqBottomTriggered = true;  // already present
+    }
+    if (tofTopReady) {
+        tofTop.writeReg(VL53L0X::SYSTEM_INTERRUPT_CLEAR, 0x01);
+        attachInterrupt(digitalPinToInterrupt(VL53L0X_IRQ_TOP), onTofTopIrq, FALLING);
+        if (digitalRead(VL53L0X_IRQ_TOP) == LOW) irqTopTriggered = true;
+    }
+    interruptsArmed = true;
+    Serial.println("[🔔] Presence interrupts armed");
+}
+
+void disarmInterrupts() {
+    if (!interruptsArmed) return;
+    if (tofBottomReady) detachInterrupt(digitalPinToInterrupt(VL53L0X_IRQ_BOTTOM));
+    if (tofTopReady)    detachInterrupt(digitalPinToInterrupt(VL53L0X_IRQ_TOP));
+    irqBottomTriggered = false;
+    irqTopTriggered    = false;
+    interruptsArmed = false;
+    Serial.println("[🔕] Presence interrupts disarmed");
+}
+
+void updateInterrupts() {
+    bool shouldArm = isNightNow() && !lightsOn && (overrideMode == 0);
+    if (shouldArm && !interruptsArmed) {
+        armInterrupts();
+    } else if (!shouldArm && interruptsArmed) {
+        disarmInterrupts();
     }
 }
 
@@ -565,15 +724,12 @@ bool evaluate() {
         return false;
     }
 
-    // Advance the internal clock by elapsed millis
-    time_t nowEpoch = currentEpoch + ((millis() - lastTimeSync) / 1000);
-
     // Condition 1: Is it dark enough?
     bool isDim = (lux >= 0 && lux < LUX_THRESHOLD);
 
     // Condition 2: Is it after sunset OR before sunrise?
     // Between sunrise and sunset = daytime → no lights needed
-    bool isNight = (nowEpoch >= sunsetEpoch || nowEpoch < sunriseEpoch);
+    bool isNight = isNightNow();
 
     // Condition 3: Was presence recently detected by either ToF sensor?
     bool hasMotion = (presenceBottom || presenceTop);
@@ -1159,8 +1315,13 @@ void handleDistance() {
             return;
         }
 
-        if (isBottom) configuredDistanceBottomMm = (unsigned long)newDist;
-        else          configuredDistanceTopMm    = (unsigned long)newDist;
+        if (isBottom) {
+            configuredDistanceBottomMm = (unsigned long)newDist;
+            if (tofBottomReady) applyToFThreshold(tofBottom, configuredDistanceBottomMm);
+        } else {
+            configuredDistanceTopMm = (unsigned long)newDist;
+            if (tofTopReady) applyToFThreshold(tofTop, configuredDistanceTopMm);
+        }
 
         Serial.printf("[⚙] Distance %s set to %lumm (HTTP)\n",
                       isBottom ? "bottom" : "top",

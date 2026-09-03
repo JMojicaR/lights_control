@@ -32,6 +32,8 @@
 // ── Pins ────────────────────────────────────────
 #define VL53L0X_XSHUT_BOTTOM  4   // VL53L0X ToF sensor at bottom of stairs (XSHUT pin)
 #define VL53L0X_XSHUT_TOP     6   // VL53L0X ToF sensor at top of stairs (XSHUT pin)
+#define VL53L0X_IRQ_BOTTOM    7   // VL53L0X bottom GPIO1 (interrupt out) → ESP32 GPIO 7
+#define VL53L0X_IRQ_TOP       8   // VL53L0X top GPIO1 (interrupt out)    → ESP32 GPIO 8
 #define LED_MOSFET_PIN        5   // IRLZ44N gate for 12V LED strip
 #define STATUS_LED_PIN        2   // Built-in LED (2 = most ESP32-S3 SuperMini)
 
@@ -56,6 +58,7 @@
 #define DISTANCE_MAX_MM          150   // Longest allowed presence distance (15cm)
 // Range status: 0=valid, other=out-of-range or error
 #define VL53L0X_TIMING_BUDGET_MS  33  // 33ms = standard speed (~1.2m range)
+#define VL53L0X_INTERMEASUREMENT_MS  50  // Continuous-ranging period (ms) between measurements
 
 // ── Timing ──────────────────────────────────────
 #define POLL_INTERVAL_DEFAULT_SEC  5    // Default sensor polling interval (seconds), configurable via HTTP
