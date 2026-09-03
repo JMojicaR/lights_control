@@ -176,61 +176,32 @@ void setup() {
     digitalWrite(VL53L0X_XSHUT_TOP, LOW);
     delay(10);
 
-    // Init TOP first: wake it at 0x29, then move it to the alternate address
-    // (0x30) so the default 0x29 is free for the bottom sensor.
-    digitalWrite(VL53L0X_XSHUT_TOP, HIGH);
-    delay(10);
-    if (tofTop.init(true)) {  // true = use 2.8V mode (more stable)
-        tofTop.setAddress(VL53L0X_ADDR_ALT);
-        tofTop.setTimeout(500);
-        tofTop.setMeasurementTimingBudget(VL53L0X_TIMING_BUDGET_MS * 1000UL);
-        Serial.printf("[✓] VL53L0X top ready (addr 0x%02X)\n", tofTop.getAddress());
-        tofTopReady = true;
-    } else {
-        Serial.println("[✗] VL53L0X top not found — check wiring");
-    }
-
-    // Init BOTTOM second: it boots at the default 0x29, now free.
-    digitalWrite(VL53L0X_XSHUT_BOTTOM, HIGH);
-    delay(10);
-    if (tofBottom.init(true)) {
-        tofBottom.setAddress(VL53L0X_ADDR_DEFAULT);
-        tofBottom.setTimeout(500);
-        tofBottom.setMeasurementTimingBudget(VL53L0X_TIMING_BUDGET_MS * 1000UL);
-        Serial.printf("[✓] VL53L0X bottom ready (addr 0x%02X)\n", tofBottom.getAddress());
-        tofBottomReady = true;
-    } else {
-        Serial.println("[✗] VL53L0X bottom not found — check wiring");
-    }
+    // Init TOP first (0x29 → 0x30), then BOTTOM (0x29). Each helper configures
+    // the sensor's GPIO1 presence interrupt and starts continuous ranging.
+    initTopSensor();
+    initBottomSensor();
 
     // ── Post-init reachability check ──
     // Verify each sensor actually answers at its assigned address. This catches
     // an address collision (a sensor silently moved to the wrong address would
     // otherwise read as a constant 65535).
-    if (tofBottom.readReg(VL53L0X::IDENTIFICATION_MODEL_ID) != 0xEE) {
+    if (tofBottomReady && tofBottom.readReg(VL53L0X::IDENTIFICATION_MODEL_ID) != 0xEE) {
         Serial.println("[⚠] Bottom sensor not reachable at 0x29 — possible address collision");
     }
-    if (tofTop.readReg(VL53L0X::IDENTIFICATION_MODEL_ID) != 0xEE) {
+    if (tofTopReady && tofTop.readReg(VL53L0X::IDENTIFICATION_MODEL_ID) != 0xEE) {
         Serial.println("[⚠] Top sensor not reachable at 0x30 — possible address collision");
     }
 
-    // ── Configure VL53L0X GPIO1 as a presence interrupt ──
-    // Each sensor's GPIO1 pin is set to fire (active LOW) whenever the measured
-    // distance drops below the presence threshold, then continuous ranging is
-    // started. Detection is now interrupt-driven — no polling loop.
-    if (tofBottomReady) {
-        configureToFInterrupt(tofBottom, configuredDistanceBottomMm);
-        tofBottom.startContinuous(VL53L0X_INTERMEASUREMENT_MS);
-        pinMode(VL53L0X_IRQ_BOTTOM, INPUT_PULLUP);
-        Serial.printf("[🔔] Bottom sensor → interrupt on GPIO %d (threshold %lumm)\n",
-                      VL53L0X_IRQ_BOTTOM, configuredDistanceBottomMm);
-    }
-    if (tofTopReady) {
-        configureToFInterrupt(tofTop, configuredDistanceTopMm);
-        tofTop.startContinuous(VL53L0X_INTERMEASUREMENT_MS);
-        pinMode(VL53L0X_IRQ_TOP, INPUT_PULLUP);
-        Serial.printf("[🔔] Top sensor → interrupt on GPIO %d (threshold %lumm)\n",
-                      VL53L0X_IRQ_TOP, configuredDistanceTopMm);
+    // ── Missing-sensor recovery (boot scan) ──
+    // If BOTH sensors are missing, block here and retry until at least one is
+    // connected — the controller cannot detect presence with zero sensors. When
+    // only one sensor is missing the system stays operational and the periodic
+    // re-scan in loop() recovers it once it is connected.
+    while (!tofBottomReady && !tofTopReady) {
+        Serial.println("[🔎] No VL53L0X sensors detected — waiting for a sensor to be connected…");
+        delay(2000);
+        initTopSensor();
+        if (!tofTopReady) initBottomSensor();
     }
 
     // BH1750 lux sensor init
@@ -291,6 +262,19 @@ void loop() {
     // latch flags that are consumed here; the presence timeout (turn the lights
     // off after the configured duration) also runs every loop.
     processTofInterrupts();
+
+    // ── Missing-sensor re-scan (hot-plug recovery) ──
+    // If a VL53L0X failed to initialize at boot, re-check for it periodically
+    // (non-blocking) so it can be recovered once it is connected. The system
+    // stays operational with whatever sensors are present.
+    static unsigned long lastSensorScan = 0;
+    if (!tofBottomReady || !tofTopReady) {
+        unsigned long scanMs = SENSOR_SCAN_INTERVAL_SEC * 1000UL;
+        if (now - lastSensorScan >= scanMs) {
+            lastSensorScan = now;
+            scanForMissingSensors();
+        }
+    }
 
     // ── Ambient light (BH1750) polling (configurable interval, default 5s) ──
     // The ToF sensors no longer need polling; only the lux sensor is read on a
@@ -570,6 +554,133 @@ void configureToFInterrupt(VL53L0X &sensor, unsigned long thresholdMm) {
     uint8_t hv = sensor.readReg(VL53L0X::GPIO_HV_MUX_ACTIVE_HIGH);
     sensor.writeReg(VL53L0X::GPIO_HV_MUX_ACTIVE_HIGH, hv & 0xEF); // active-low (clear bit 4)
     sensor.writeReg(VL53L0X::SYSTEM_INTERRUPT_CLEAR, 0x01);       // clear any pending IRQ
+}
+
+// ── Initialize a single VL53L0X sensor — bottom (addr 0x29) ──
+// Wakes the bottom sensor and initializes it at the default 0x29 address, then
+// configures its GPIO1 presence interrupt and starts continuous ranging.
+// Returns true on success; returns early (true) if already initialized. Leaves
+// the sensor in shutdown (XSHUT LOW) on failure so it cannot collide on the bus.
+bool initBottomSensor() {
+    if (tofBottomReady) return true;
+
+    digitalWrite(VL53L0X_XSHUT_BOTTOM, HIGH);
+    delay(10);
+    if (!tofBottom.init(true)) {   // true = use 2.8V mode (more stable)
+        digitalWrite(VL53L0X_XSHUT_BOTTOM, LOW);
+        Serial.println("[✗] VL53L0X bottom not found — check wiring");
+        return false;
+    }
+
+    tofBottom.setAddress(VL53L0X_ADDR_DEFAULT);
+    tofBottom.setTimeout(500);
+    tofBottom.setMeasurementTimingBudget(VL53L0X_TIMING_BUDGET_MS * 1000UL);
+    tofBottomReady = true;
+
+    configureToFInterrupt(tofBottom, configuredDistanceBottomMm);
+    tofBottom.startContinuous(VL53L0X_INTERMEASUREMENT_MS);
+    pinMode(VL53L0X_IRQ_BOTTOM, INPUT_PULLUP);
+    Serial.printf("[✓] VL53L0X bottom ready (addr 0x%02X) → interrupt on GPIO %d (threshold %lumm)\n",
+                  tofBottom.getAddress(), VL53L0X_IRQ_BOTTOM, configuredDistanceBottomMm);
+    return true;
+}
+
+// ── Initialize a single VL53L0X sensor — top (addr 0x30) ──
+// The top sensor must first claim the default 0x29 address, then be moved to
+// 0x30 so 0x29 stays free for the bottom sensor. If the bottom sensor is
+// already active (hot-plug case) it is briefly held in shutdown during the
+// address change and then re-initialized. Returns true on success.
+bool initTopSensor() {
+    if (tofTopReady) return true;
+
+    bool hadBottom = tofBottomReady;
+    if (hadBottom) {
+        // Free 0x29 so the top sensor can claim it temporarily.
+        detachInterrupt(digitalPinToInterrupt(VL53L0X_IRQ_BOTTOM));
+        digitalWrite(VL53L0X_XSHUT_BOTTOM, LOW);
+        delay(10);
+    }
+
+    digitalWrite(VL53L0X_XSHUT_TOP, HIGH);
+    delay(10);
+    bool ok = false;
+    if (tofTop.init(true)) {
+        tofTop.setAddress(VL53L0X_ADDR_ALT);
+        tofTop.setTimeout(500);
+        tofTop.setMeasurementTimingBudget(VL53L0X_TIMING_BUDGET_MS * 1000UL);
+        tofTopReady = true;
+
+        configureToFInterrupt(tofTop, configuredDistanceTopMm);
+        tofTop.startContinuous(VL53L0X_INTERMEASUREMENT_MS);
+        pinMode(VL53L0X_IRQ_TOP, INPUT_PULLUP);
+        Serial.printf("[✓] VL53L0X top ready (addr 0x%02X) → interrupt on GPIO %d (threshold %lumm)\n",
+                      tofTop.getAddress(), VL53L0X_IRQ_TOP, configuredDistanceTopMm);
+        ok = true;
+    } else {
+        digitalWrite(VL53L0X_XSHUT_TOP, LOW);  // leave shutdown on failure
+        Serial.println("[✗] VL53L0X top not found — check wiring");
+    }
+
+    if (hadBottom) {
+        // Restore the bottom sensor that was held in shutdown.
+        digitalWrite(VL53L0X_XSHUT_BOTTOM, HIGH);
+        delay(10);
+        if (tofBottom.init(true)) {
+            tofBottom.setAddress(VL53L0X_ADDR_DEFAULT);
+            tofBottom.setTimeout(500);
+            tofBottom.setMeasurementTimingBudget(VL53L0X_TIMING_BUDGET_MS * 1000UL);
+            configureToFInterrupt(tofBottom, configuredDistanceBottomMm);
+            tofBottom.startContinuous(VL53L0X_INTERMEASUREMENT_MS);
+            pinMode(VL53L0X_IRQ_BOTTOM, INPUT_PULLUP);
+            Serial.println("[✓] VL53L0X bottom re-initialized after top scan");
+        } else {
+            tofBottomReady = false;
+            Serial.println("[✗] VL53L0X bottom lost while scanning for top");
+        }
+    }
+
+    return ok;
+}
+
+// ── Re-attach presence interrupts for every ready sensor ──
+// Called after a hot-plug re-init while interrupts were armed (the re-init of a
+// sensor detaches its interrupt). No-op when interrupts are not armed.
+void rearmInterruptsIfArmed() {
+    if (!interruptsArmed) return;
+    if (tofBottomReady) {
+        tofBottom.writeReg(VL53L0X::SYSTEM_INTERRUPT_CLEAR, 0x01);
+        attachInterrupt(digitalPinToInterrupt(VL53L0X_IRQ_BOTTOM), onTofBottomIrq, FALLING);
+        if (digitalRead(VL53L0X_IRQ_BOTTOM) == LOW) irqBottomTriggered = true;
+    }
+    if (tofTopReady) {
+        tofTop.writeReg(VL53L0X::SYSTEM_INTERRUPT_CLEAR, 0x01);
+        attachInterrupt(digitalPinToInterrupt(VL53L0X_IRQ_TOP), onTofTopIrq, FALLING);
+        if (digitalRead(VL53L0X_IRQ_TOP) == LOW) irqTopTriggered = true;
+    }
+}
+
+// ── Scan for missing sensors and recover them (hot-plug) ──
+// Non-blocking: called periodically from loop(). Attempts to re-initialize any
+// VL53L0X that failed to initialize at boot. Re-arms interrupts afterward if a
+// sensor was touched while interrupts were armed.
+void scanForMissingSensors() {
+    bool disturbed = false;
+
+    if (!tofBottomReady) {
+        disturbed = true;
+        if (initBottomSensor())
+            Serial.println("[🔎] Bottom sensor connected");
+    }
+
+    if (!tofTopReady) {
+        // Scanning for the top briefly shuts down + re-inits the bottom to free
+        // 0x29, so mark interrupts as disturbed either way.
+        disturbed = true;
+        if (initTopSensor())
+            Serial.println("[🔎] Top sensor connected");
+    }
+
+    if (disturbed) rearmInterruptsIfArmed();
 }
 
 // ── Handle a single ToF interrupt ──
@@ -982,6 +1093,9 @@ async function fetchData() {
     } else if (d.distance_bottom_mm > 0) {
       sTileB.className = 'tile motion';
       sMetricB.innerHTML = distB_cm + ' <small style="font-size:.65rem;opacity:.6">cm · clear</small>';
+    } else if (d.sensor_bottom_ok === false) {
+      sTileB.className = 'tile motion';
+      sMetricB.innerHTML = '<span style="color:#f87171">MISSING</span>';
     } else {
       sTileB.className = 'tile motion';
       sMetricB.textContent = '--';
@@ -997,6 +1111,9 @@ async function fetchData() {
     } else if (d.distance_top_mm > 0) {
       sTileT.className = 'tile motion';
       sMetricT.innerHTML = distT_cm + ' <small style="font-size:.65rem;opacity:.6">cm · clear</small>';
+    } else if (d.sensor_top_ok === false) {
+      sTileT.className = 'tile motion';
+      sMetricT.innerHTML = '<span style="color:#f87171">MISSING</span>';
     } else {
       sTileT.className = 'tile motion';
       sMetricT.textContent = '--';
@@ -1170,6 +1287,8 @@ void handleAPI() {
     json += "\"lux\":" + String(lux, 1) + ",";
     json += "\"presence_bottom\":" + String(presenceBottom ? "true" : "false") + ",";
     json += "\"presence_top\":" + String(presenceTop ? "true" : "false") + ",";
+    json += "\"sensor_bottom_ok\":" + String(tofBottomReady ? "true" : "false") + ",";
+    json += "\"sensor_top_ok\":" + String(tofTopReady ? "true" : "false") + ",";
     json += "\"distance_bottom_mm\":" + String(distanceBottom) + ",";
     json += "\"distance_top_mm\":" + String(distanceTop) + ",";
     json += "\"distance_bottom_mm_set\":" + String(configuredDistanceBottomMm) + ",";

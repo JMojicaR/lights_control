@@ -56,6 +56,7 @@
 #define LOOP_DELAY_MS           10    // Base loop delay — keeps web server + heartbeat responsive
 #define TIME_RESYNC_MIN     60    // Re-sync time from HTTP every N minutes
 #define SUNSET_RESYNC_MIN   360   // Re-sync sunset from HTTP every 6 hours
+#define SENSOR_SCAN_INTERVAL_SEC 10  // Re-check interval (s) for a missing VL53L0X sensor (hot-plug recovery)
 
 // ── PWM Fade ─────────────────────────────────────
 #define PWM_CHANNEL         0     // LEDC channel for MOSFET PWM
