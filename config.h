@@ -38,6 +38,12 @@
 // VL53L0X I²C addresses (when using two sensors on same bus)
 #define VL53L0X_ADDR_DEFAULT  0x29  // Default I²C address (sensor 0 — bottom)
 #define VL53L0X_ADDR_ALT      0x30  // Alternate address for second sensor (top)
+// Number of VL53L0X sensors wired (1 = bottom only, 2 = bottom + top).
+// Configurable at runtime via the dashboard, persisted to NVS, and read in
+// setup() BEFORE the sensors are configured so the correct number initializes.
+#define SENSOR_COUNT_DEFAULT  2     // Default number of sensors (2 = both)
+#define SENSOR_COUNT_MIN      1     // Minimum — bottom sensor only
+#define SENSOR_COUNT_MAX      2     // Maximum — bottom + top
 // Presence detection window (mm): distance >= MIN and distance < threshold → person detected
 // Measure range: 3cm floor, threshold configurable up to 15cm
 #define VL53L0X_MIN_PRESENCE_MM  30    // 3cm — readings below this are ignored (ghost/crosstalk)

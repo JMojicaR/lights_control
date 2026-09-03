@@ -58,6 +58,7 @@ const char* PREF_KEY_DURATION = "dur_sec";
 const char* PREF_KEY_DIST_BOTTOM = "dist_bottom_mm";
 const char* PREF_KEY_DIST_TOP = "dist_top_mm";
 const char* PREF_KEY_POLL = "poll_sec";
+const char* PREF_KEY_SENSOR_COUNT = "sensor_count";
 
 // ── Time tracking ───────────────────────────────
 unsigned long lastTimeSync   = 0;      // millis() of last HTTP time sync
@@ -106,6 +107,10 @@ unsigned long configuredDistanceTopMm    = DISTANCE_DEFAULT_MM;  // top sensor p
 // ── Dynamic sensor polling interval (changeable via HTTP) ─
 unsigned long configuredPollIntervalSec = POLL_INTERVAL_DEFAULT_SEC;  // seconds between sensor reads
 
+// ── Number of VL53L0X sensors (changeable via HTTP, persisted to NVS) ─
+// Read in setup() BEFORE sensor init so the correct number initializes.
+unsigned long configuredSensorCount = SENSOR_COUNT_DEFAULT;
+
 // ── Manual override ─────────────────────────────
 //  0 = AUTO (use sensor/sunset logic)
 //  1 = FORCE ON
@@ -132,6 +137,7 @@ void setup() {
       unsigned long savedBottom = prefs.getULong(PREF_KEY_DIST_BOTTOM, DISTANCE_DEFAULT_MM);
       unsigned long savedTop = prefs.getULong(PREF_KEY_DIST_TOP, DISTANCE_DEFAULT_MM);
       unsigned long savedPoll = prefs.getULong(PREF_KEY_POLL, POLL_INTERVAL_DEFAULT_SEC);
+      unsigned long savedCount = prefs.getULong(PREF_KEY_SENSOR_COUNT, SENSOR_COUNT_DEFAULT);
       prefs.end();
 
       if (savedDur >= DURATION_MIN_SEC && savedDur <= DURATION_MAX_SEC) {
@@ -148,15 +154,17 @@ void setup() {
                                    ? savedTop : DISTANCE_DEFAULT_MM;
       configuredPollIntervalSec  = (savedPoll >= POLL_INTERVAL_MIN_SEC && savedPoll <= POLL_INTERVAL_MAX_SEC)
                                    ? savedPoll : POLL_INTERVAL_DEFAULT_SEC;
+      configuredSensorCount      = (savedCount >= SENSOR_COUNT_MIN && savedCount <= SENSOR_COUNT_MAX)
+                                   ? savedCount : SENSOR_COUNT_DEFAULT;
     } else {
       configuredDurationSec = DEFAULT_LIGHT_DURATION_SEC;
       Serial.printf("[⚠] Preferences unavailable — using default duration %lu\n",
               configuredDurationSec);
     }
     activeDurationSec = configuredDurationSec;
-    Serial.printf("[⚙] Loaded: duration %lus | dist bottom %lumm | dist top %lumm | poll %lus\n",
+    Serial.printf("[⚙] Loaded: duration %lus | dist bottom %lumm | dist top %lumm | poll %lus | sensors %lu\n",
                   configuredDurationSec, configuredDistanceBottomMm,
-                  configuredDistanceTopMm, configuredPollIntervalSec);
+                  configuredDistanceTopMm, configuredPollIntervalSec, configuredSensorCount);
 
     // Pins — LED MOSFET uses PWM for fade
     pinMode(STATUS_LED_PIN, OUTPUT);
@@ -177,17 +185,24 @@ void setup() {
     delay(10);
 
     // Init TOP first: wake it at 0x29, then move it to the alternate address
-    // (0x30) so the default 0x29 is free for the bottom sensor.
-    digitalWrite(VL53L0X_XSHUT_TOP, HIGH);
-    delay(10);
-    if (tofTop.init(true)) {  // true = use 2.8V mode (more stable)
-        tofTop.setAddress(VL53L0X_ADDR_ALT);
-        tofTop.setTimeout(500);
-        tofTop.setMeasurementTimingBudget(VL53L0X_TIMING_BUDGET_MS * 1000UL);
-        Serial.printf("[✓] VL53L0X top ready (addr 0x%02X)\n", tofTop.getAddress());
-        tofTopReady = true;
+    // (0x30) so the default 0x29 is free for the bottom sensor. The top sensor
+    // is only initialized when the configured sensor count is 2; with 1 sensor
+    // its XSHUT stays LOW (shutdown) so it can never collide on the bus.
+    if (configuredSensorCount >= 2) {
+        digitalWrite(VL53L0X_XSHUT_TOP, HIGH);
+        delay(10);
+        if (tofTop.init(true)) {  // true = use 2.8V mode (more stable)
+            tofTop.setAddress(VL53L0X_ADDR_ALT);
+            tofTop.setTimeout(500);
+            tofTop.setMeasurementTimingBudget(VL53L0X_TIMING_BUDGET_MS * 1000UL);
+            Serial.printf("[✓] VL53L0X top ready (addr 0x%02X)\n", tofTop.getAddress());
+            tofTopReady = true;
+        } else {
+            Serial.println("[✗] VL53L0X top not found — check wiring");
+        }
     } else {
-        Serial.println("[✗] VL53L0X top not found — check wiring");
+        Serial.printf("[ℹ] Sensor count = %lu — top sensor disabled (XSHUT held LOW)\n",
+                      configuredSensorCount);
     }
 
     // Init BOTTOM second: it boots at the default 0x29, now free.
@@ -207,10 +222,10 @@ void setup() {
     // Verify each sensor actually answers at its assigned address. This catches
     // an address collision (a sensor silently moved to the wrong address would
     // otherwise read as a constant 65535).
-    if (tofBottom.readReg(VL53L0X::IDENTIFICATION_MODEL_ID) != 0xEE) {
+    if (tofBottomReady && tofBottom.readReg(VL53L0X::IDENTIFICATION_MODEL_ID) != 0xEE) {
         Serial.println("[⚠] Bottom sensor not reachable at 0x29 — possible address collision");
     }
-    if (tofTop.readReg(VL53L0X::IDENTIFICATION_MODEL_ID) != 0xEE) {
+    if (tofTopReady && tofTop.readReg(VL53L0X::IDENTIFICATION_MODEL_ID) != 0xEE) {
         Serial.println("[⚠] Top sensor not reachable at 0x30 — possible address collision");
     }
 
@@ -258,6 +273,7 @@ void setup() {
     server.on("/api/duration", handleDuration);
     server.on("/api/distance", handleDistance);
     server.on("/api/poll", handlePoll);
+    server.on("/api/sensors", handleSensorCount);
     server.onNotFound([]() {
         server.send(404, "application/json", "{\"error\":\"not found\"}");
     });
@@ -929,6 +945,15 @@ void handleRoot() {
     <button class="btn btn-sm" onclick="setPoll()">Set</button>
   </div>
 
+  <div class="duration-row">
+    <label for="sensorCountInput">🔢 Sensors:</label>
+    <select id="sensorCountInput" style="flex:1;background:#0f172a;border:1px solid #334155;border-radius:8px;padding:8px 10px;color:#e2e8f0;font-size:.85rem;text-align:center">
+      <option value="1">1 sensor (bottom only)</option>
+      <option value="2">2 sensors (bottom + top)</option>
+    </select>
+    <button class="btn btn-sm" onclick="setSensorCount()">Set</button>
+  </div>
+
   <div class="btn-row">
     <button class="btn force-on" id="btnOn" onclick="setOverride('on')">🔆 Force ON</button>
     <button class="btn active" id="btnAuto" onclick="setOverride('auto')">🔄 Auto</button>
@@ -950,6 +975,7 @@ const durInputEl = document.getElementById('durInput');
 const distBottomEl = document.getElementById('distBottomInput');
 const distTopEl = document.getElementById('distTopInput');
 const pollInputEl = document.getElementById('pollInput');
+const sensorCountEl = document.getElementById('sensorCountInput');
 
 async function fetchData() {
   try {
@@ -1041,6 +1067,9 @@ async function fetchData() {
     if (document.activeElement !== pollInputEl) {
       pollInputEl.value = d.poll_interval_sec;
     }
+    if (document.activeElement !== sensorCountEl) {
+      sensorCountEl.value = d.sensor_count;
+    }
 
     // Uptime
     document.getElementById('uptime').textContent = 'Uptime ' + d.uptime;
@@ -1117,6 +1146,22 @@ async function setPoll() {
   }
 }
 
+async function setSensorCount() {
+  const count = sensorCountEl.value;
+  try {
+    const r = await fetch('/api/sensors?count=' + count, {method:'POST'});
+    const d = await r.json();
+    if (d.ok) {
+      sensorCountEl.value = d.sensor_count;
+      alert('Sensor count set to ' + d.sensor_count + '. Reboot the device to apply.');
+    } else if (d.error) {
+      alert(d.error);
+    }
+  } catch(e) {
+    console.error('Sensor count error:', e);
+  }
+}
+
 fetchData();
 setInterval(fetchData, 2000);
 </script>
@@ -1183,6 +1228,7 @@ void handleAPI() {
     json += "\"duration_sec\":" + String(configuredDurationSec) + ",";
     json += "\"active_duration_sec\":" + String(activeDurationSec) + ",";
     json += "\"poll_interval_sec\":" + String(configuredPollIntervalSec) + ",";
+    json += "\"sensor_count\":" + String(configuredSensorCount) + ",";
     json += "\"remaining_sec\":" + String(remainingSec);
     json += "}";
 
@@ -1368,6 +1414,54 @@ void handlePoll() {
         snprintf(resp, sizeof(resp),
                  "{\"poll_interval_sec\":%lu}",
                  configuredPollIntervalSec);
+        server.send(200, "application/json", resp);
+    }
+}
+
+// ═════════════════════════════════════════════════
+// Sensor count endpoint — /api/sensors
+//   GET          → returns current configured sensor count (1 or 2)
+//   POST ?count=N → sets sensor count (clamped to 1 or 2), persisted to NVS
+//
+// The count is read in setup() BEFORE the VL53L0X sensors are configured, so a
+// change made here takes effect on the NEXT reboot (the I²C addresses cannot be
+// safely re-assigned at runtime once a sensor is already ranging).
+// ═════════════════════════════════════════════════
+void handleSensorCount() {
+    if (server.method() == HTTP_POST || server.hasArg("count")) {
+        long newCount = server.arg("count").toInt();
+        if (newCount < SENSOR_COUNT_MIN || newCount > SENSOR_COUNT_MAX) {
+            char err[128];
+            snprintf(err, sizeof(err),
+                     "{\"error\":\"sensor count must be %d or %d\"}",
+                     SENSOR_COUNT_MIN, SENSOR_COUNT_MAX);
+            server.send(400, "application/json", err);
+            return;
+        }
+
+        configuredSensorCount = (unsigned long)newCount;
+        Serial.printf("[⚙] Sensor count set to %lu (HTTP) — takes effect on next reboot\n",
+                      configuredSensorCount);
+
+        bool persisted = false;
+        if (prefs.begin(PREF_NAMESPACE, false)) {
+            persisted = (prefs.putULong(PREF_KEY_SENSOR_COUNT, configuredSensorCount) > 0);
+            prefs.end();
+        }
+        if (!persisted) {
+            Serial.println("[⚠] Failed to persist sensor count to NVS");
+        }
+
+        char resp[160];
+        snprintf(resp, sizeof(resp),
+                 "{\"sensor_count\":%lu,\"persisted\":%s,\"reboot_required\":true,\"ok\":true}",
+                 configuredSensorCount, persisted ? "true" : "false");
+        server.send(200, "application/json", resp);
+    } else {
+        char resp[128];
+        snprintf(resp, sizeof(resp),
+                 "{\"sensor_count\":%lu}",
+                 configuredSensorCount);
         server.send(200, "application/json", resp);
     }
 }
