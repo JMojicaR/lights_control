@@ -1,0 +1,40 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="420" height="360" viewBox="0 0 420 360" font-family="DejaVu Sans, Arial, sans-serif">
+  <rect width="420" height="360" fill="#ffffff"/>
+  <text x="210" y="30" font-size="20" font-weight="bold" text-anchor="middle" fill="#111">P82B715 — I²C Bus Extender (DIP-8 / SOIC-8)</text>
+  <text x="210" y="52" font-size="13" text-anchor="middle" fill="#555">Top view · pin 1 = top-left (notch up)</text>
+
+  <!-- Body -->
+  <rect x="110" y="110" width="200" height="160" rx="8" fill="#222" stroke="#111" stroke-width="2"/>
+  <!-- Notch -->
+  <path d="M 170 110 A 40 12 0 0 1 250 110 Z" fill="#444" stroke="#111" stroke-width="1.5"/>
+  <!-- Pin 1 dot -->
+  <circle cx="122" cy="122" r="6" fill="#ffd23f"/>
+
+  <!-- Left pins -->
+  <g stroke="#333" stroke-width="2">
+    <line x1="110" y1="130" x2="82" y2="130"/><line x1="110" y1="165" x2="82" y2="165"/>
+    <line x1="110" y1="200" x2="82" y2="200"/><line x1="110" y1="235" x2="82" y2="235"/>
+  </g>
+  <!-- Right pins -->
+  <g stroke="#333" stroke-width="2">
+    <line x1="310" y1="130" x2="338" y2="130"/><line x1="310" y1="165" x2="338" y2="165"/>
+    <line x1="310" y1="200" x2="338" y2="200"/><line x1="310" y1="235" x2="338" y2="235"/>
+  </g>
+
+  <!-- Left labels -->
+  <text x="72" y="134" font-size="13" text-anchor="end" fill="#333">1 · NC</text>
+  <text x="72" y="169" font-size="13" text-anchor="end" fill="#333">2 · Lx</text>
+  <text x="72" y="204" font-size="13" text-anchor="end" fill="#333">3 · Sx</text>
+  <text x="72" y="239" font-size="13" text-anchor="end" fill="#333">4 · GND</text>
+
+  <!-- Right labels -->
+  <text x="348" y="134" font-size="13" fill="#333">8 · VCC</text>
+  <text x="348" y="169" font-size="13" fill="#333">7 · Ly</text>
+  <text x="348" y="204" font-size="13" fill="#333">6 · Sy</text>
+  <text x="348" y="239" font-size="13" fill="#333">5 · NC</text>
+
+  <!-- Function legend -->
+  <text x="30" y="300" font-size="12" fill="#333">Sx / Sy = local (controller-side) SDA / SCL — normal 400 pF budget</text>
+  <text x="30" y="320" font-size="12" fill="#333">Lx / Ly = long (remote-side) SDA / SCL — up to 3000 pF (tens of metres)</text>
+  <text x="30" y="340" font-size="12" fill="#333">VCC 3–12 V · add strong pull-ups (470 Ω–1 kΩ) on the Lx/Ly side</text>
+</svg>

@@ -29,6 +29,23 @@
 #define I2C_SDA         12
 #define I2C_SCL         13
 
+// ── I²C Bus Electrical Settings (3 m sensor cable) ──────────
+// The two VL53L0X + BH1750 sit ~3 m from the ESP32, so the bus is driven
+// conservatively. The 400 pF I²C bus-capacitance budget — not wire gauge — is
+// the hard limit on cable length, and ~3 m of cable already consumes most of it.
+#define I2C_CLOCK_HZ    100000  // Standard mode (100 kHz). Do NOT raise for a 3 m run.
+                                // If comms are flaky, drop to 50000 (50 kHz) before
+                                // anything else — speed is the first casualty of a
+                                // long, capacitive bus.
+#define I2C_TIMEOUT_MS  50      // Wire.setTimeOut(): fail fast on a dead/stuck bus
+                                // instead of hanging the loop.
+
+// Pull-up resistors (hardware change, no code): replace the 10 kΩ pull-ups on the
+// VL53L0X/BH1750 breakout boards with 2.2–3.3 kΩ to 3.3 V for a 3 m cable. 10 kΩ
+// charges the ~300 pF bus too slowly to meet the 100 kHz timing budget (rise time
+// blows past 1 µs). Never go below ~1.5 kΩ at 3.3 V — I²C sink current is spec'd
+// at 3 mA. Full cable/extender guidance lives in ELECTRICAL.md.
+
 // ── Light & Motion Thresholds ───────────────────
 #define LUX_THRESHOLD       30    // Lux below this = "dark enough" for lights
 #define DEFAULT_LIGHT_DURATION_SEC  90  // Keep lights ON this many seconds after last motion (default, changeable via HTTP)

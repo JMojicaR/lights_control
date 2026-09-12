@@ -162,8 +162,11 @@ void setup() {
     pinMode(STATUS_LED_PIN, OUTPUT);
     digitalWrite(STATUS_LED_PIN, LOW);
 
-    // I²C for BH1750 + VL53L0X (shared bus)
-    Wire.begin(I2C_SDA, I2C_SCL);
+    // I²C for BH1750 + VL53L0X (shared bus, ~3 m cable)
+    // Explicit 100 kHz standard mode + a fail-fast timeout: the long cable's
+    // capacitance caps the reliable speed, and a stuck bus must not hang boot.
+    Wire.begin(I2C_SDA, I2C_SCL, I2C_CLOCK_HZ);
+    Wire.setTimeOut(I2C_TIMEOUT_MS);
 
     // ── VL53L0X ToF sensor init (two sensors on same I²C bus) ──
     // Strategy: hold both in shutdown, then wake one at a time. The FIRST

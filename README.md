@@ -131,6 +131,11 @@ GPIO 5 ──[10KΩ]──┬── IRLZ44N GATE
 12V PSU (-) ─── IRLZ44N SOURCE ─── GND (common)
 ```
 
+> ⚡ **3 m sensor run** — the sensors sit ~3 m from the ESP32, so the I²C bus
+> needs low pull-ups (2.2–3.3 kΩ), 100 kHz standard mode, and twisted-pair cable.
+> See **[ELECTRICAL.md](ELECTRICAL.md)** for the full wiring, pull-up, bus-speed,
+> and P82B715 extender guidance.
+
 ## APIs Used
 
 | API | Endpoint | Purpose | Key Required? |
@@ -226,3 +231,10 @@ FreeCAD (.FCStd) and STL models for 3D printing are in `enclosures/`:
 | `enclosures/bh1750_housing.fcstd` | BH1750 ambient light sensor housing |
 
 Print in PETG or ABS for heat resistance (PLA may warp near the MOSFET).
+
+## Reference Documents
+
+| Folder / File | Contents |
+|---------------|----------|
+| [`datasheets/`](datasheets/) | Component datasheets (ESP32-S3, VL53L0X, BH1750, IRLZ44N, P82B715) + pinout images |
+| [`ELECTRICAL.md`](ELECTRICAL.md) | 3 m cable guidance — wire type, I²C pull-up resistors, bus speed, P82B715 extender |
