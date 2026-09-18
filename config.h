@@ -29,22 +29,22 @@
 #define I2C_SDA         12
 #define I2C_SCL         13
 
-// ── I²C Bus Electrical Settings (3 m sensor cable) ──────────
-// The two VL53L0X + BH1750 sit ~3 m from the ESP32, so the bus is driven
-// conservatively. The 400 pF I²C bus-capacitance budget — not wire gauge — is
-// the hard limit on cable length, and ~3 m of cable already consumes most of it.
-#define I2C_CLOCK_HZ    100000  // Standard mode (100 kHz). Do NOT raise for a 3 m run.
-                                // If comms are flaky, drop to 50000 (50 kHz) before
-                                // anything else — speed is the first casualty of a
-                                // long, capacitive bus.
+// ── I²C Bus Electrical Settings (two 3 m VL53L0X cables + local BH1750) ──
+// The two VL53L0X sit ~3 m from the ESP32 (each on its own Cat6 cable); the
+// BH1750 is local (~15 cm). Total bus capacitance is ~340 pF — inside the 400 pF
+// standard-mode budget but with little headroom, so the bus is driven at 50 kHz.
+#define I2C_CLOCK_HZ    50000   // 50 kHz — safe for two 3 m cables with the on-board
+                                // 10 kΩ pull-ups (3 in parallel = 3.3 kΩ). 100 kHz is
+                                // marginal at ~340 pF (needs a pull-up near the sink
+                                // floor); add a P82B715 to run 100 kHz with margin.
 #define I2C_TIMEOUT_MS  50      // Wire.setTimeOut(): fail fast on a dead/stuck bus
                                 // instead of hanging the loop.
 
-// Pull-up resistors (hardware change, no code): replace the 10 kΩ pull-ups on the
-// VL53L0X/BH1750 breakout boards with 2.2–3.3 kΩ to 3.3 V for a 3 m cable. 10 kΩ
-// charges the ~300 pF bus too slowly to meet the 100 kHz timing budget (rise time
-// blows past 1 µs). Never go below ~1.5 kΩ at 3.3 V — I²C sink current is spec'd
-// at 3 mA. Full cable/extender guidance lives in ELECTRICAL.md.
+// Pull-up resistors (hardware change, no code): the breakout boards' 10 kΩ pull-ups
+// (3 × 10 kΩ in parallel = 3.3 kΩ) are fine for 50 kHz — leave them alone, do NOT
+// stack extra resistors (that would push below the ~1.5 kΩ floor). Never go below
+// ~1.5 kΩ at 3.3 V — I²C sink current is spec'd at 3 mA. Full cable/extender
+// guidance lives in ELECTRICAL.md.
 
 // ── Light & Motion Thresholds ───────────────────
 #define LUX_THRESHOLD       30    // Lux below this = "dark enough" for lights
