@@ -17,3 +17,6 @@ Thumbs.db
 # Dependencies (don't commit library source)
 libraries/
 __pycache__/
+
+# Hermes agent workspace (not project source)
+.hermes/

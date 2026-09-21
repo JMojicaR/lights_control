@@ -29,6 +29,13 @@
 #define I2C_SDA         12
 #define I2C_SCL         13
 
+// ── CAN bus (TWAI) — replaces the long I²C sensor wiring ──
+// The sensors move to local smart-nodes that publish over CAN (see
+// can_protocol.h and sensor_node/). The main controller only needs a CAN
+// transceiver (SN65HVD230) wired to these pins, plus a 120 Ω terminator.
+#define CAN_TX          17   // ESP32-S3 → SN65HVD230 CTX (D)
+#define CAN_RX          18   // ESP32-S3 ← SN65HVD230 CRX (R)
+
 // ── Light & Motion Thresholds ───────────────────
 #define LUX_THRESHOLD       30    // Lux below this = "dark enough" for lights
 #define DEFAULT_LIGHT_DURATION_SEC  90  // Keep lights ON this many seconds after last motion (default, changeable via HTTP)

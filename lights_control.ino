@@ -38,18 +38,14 @@
 #include "config.h"
 #include <WiFi.h>
 #include <HTTPClient.h>
-#include <Wire.h>
-#include <BH1750.h>
-#include <VL53L0X.h>
 #include <ArduinoJson.h>
 #include <WebServer.h>
 #include <time.h>
 #include <Preferences.h>
+#include <driver/twai.h>
+#include "can_protocol.h"
 
 // ── Objects ─────────────────────────────────────
-BH1750 lightMeter;
-VL53L0X tofBottom;   // Bottom of stairs (I²C addr 0x29)
-VL53L0X tofTop;      // Top of stairs (I²C addr 0x30)
 WebServer server(80);
 Preferences prefs;
 
@@ -71,18 +67,11 @@ int           localUtcOffsetSec = -6 * 3600; // Updated from time API (Mexico Ci
 const unsigned long TIME_RESYNC_MS   = TIME_RESYNC_MIN  * 60000UL;
 const unsigned long SUNSET_RESYNC_MS = SUNSET_RESYNC_MIN * 60000UL;
 
-// ── Presence tracking (VL53L0X) ──────────────────
+// ── Presence tracking (via CAN from sensor nodes) ──
 bool     presenceBottom  = false;
 bool     presenceTop     = false;
-uint16_t distanceBottom  = 0;        // mm
-uint16_t distanceTop     = 0;        // mm
-bool     tofBottomReady  = false;    // Bottom sensor initialized
-bool     tofTopReady     = false;    // Top sensor initialized
-
-// ── Interrupt-driven presence (VL53L0X GPIO1) ────
-volatile bool irqBottomTriggered = false;  // Set by bottom-sensor ISR
-volatile bool irqTopTriggered    = false;  // Set by top-sensor ISR
-bool     interruptsArmed  = false;   // True while presence interrupts are attached
+uint16_t distanceBottom  = 0;        // mm (last CAN reading)
+uint16_t distanceTop     = 0;        // mm (last CAN reading)
 unsigned long lastMotionTime = 0;
 unsigned long motionDebounceUntil = 0;
 
@@ -162,83 +151,16 @@ void setup() {
     pinMode(STATUS_LED_PIN, OUTPUT);
     digitalWrite(STATUS_LED_PIN, LOW);
 
-    // I²C for BH1750 + VL53L0X (shared bus)
-    Wire.begin(I2C_SDA, I2C_SCL);
+    // ── CAN bus — receive sensor data from the smart-sensor nodes ──
+    // The VL53L0X (bottom/top) and BH1750 sensors each sit next to a small
+    // node that reads them over a short local I²C link and publishes over CAN.
+    // The main controller only initialises the TWAI peripheral + transceiver.
+    canSetup();
 
-    // ── VL53L0X ToF sensor init (two sensors on same I²C bus) ──
-    // Strategy: hold both in shutdown, then wake one at a time. The FIRST
-    // sensor woken MUST be moved off the default 0x29 address before the
-    // second wakes — otherwise both boot at 0x29 and a setAddress() write
-    // hits both (address collision → constant 65535 readings).
-    pinMode(VL53L0X_XSHUT_BOTTOM, OUTPUT);
-    pinMode(VL53L0X_XSHUT_TOP, OUTPUT);
-    digitalWrite(VL53L0X_XSHUT_BOTTOM, LOW);  // Hold both in shutdown
-    digitalWrite(VL53L0X_XSHUT_TOP, LOW);
-    delay(10);
-
-    // Init TOP first: wake it at 0x29, then move it to the alternate address
-    // (0x30) so the default 0x29 is free for the bottom sensor.
-    digitalWrite(VL53L0X_XSHUT_TOP, HIGH);
-    delay(10);
-    if (tofTop.init(true)) {  // true = use 2.8V mode (more stable)
-        tofTop.setAddress(VL53L0X_ADDR_ALT);
-        tofTop.setTimeout(500);
-        tofTop.setMeasurementTimingBudget(VL53L0X_TIMING_BUDGET_MS * 1000UL);
-        Serial.printf("[✓] VL53L0X top ready (addr 0x%02X)\n", tofTop.getAddress());
-        tofTopReady = true;
-    } else {
-        Serial.println("[✗] VL53L0X top not found — check wiring");
-    }
-
-    // Init BOTTOM second: it boots at the default 0x29, now free.
-    digitalWrite(VL53L0X_XSHUT_BOTTOM, HIGH);
-    delay(10);
-    if (tofBottom.init(true)) {
-        tofBottom.setAddress(VL53L0X_ADDR_DEFAULT);
-        tofBottom.setTimeout(500);
-        tofBottom.setMeasurementTimingBudget(VL53L0X_TIMING_BUDGET_MS * 1000UL);
-        Serial.printf("[✓] VL53L0X bottom ready (addr 0x%02X)\n", tofBottom.getAddress());
-        tofBottomReady = true;
-    } else {
-        Serial.println("[✗] VL53L0X bottom not found — check wiring");
-    }
-
-    // ── Post-init reachability check ──
-    // Verify each sensor actually answers at its assigned address. This catches
-    // an address collision (a sensor silently moved to the wrong address would
-    // otherwise read as a constant 65535).
-    if (tofBottom.readReg(VL53L0X::IDENTIFICATION_MODEL_ID) != 0xEE) {
-        Serial.println("[⚠] Bottom sensor not reachable at 0x29 — possible address collision");
-    }
-    if (tofTop.readReg(VL53L0X::IDENTIFICATION_MODEL_ID) != 0xEE) {
-        Serial.println("[⚠] Top sensor not reachable at 0x30 — possible address collision");
-    }
-
-    // ── Configure VL53L0X GPIO1 as a presence interrupt ──
-    // Each sensor's GPIO1 pin is set to fire (active LOW) whenever the measured
-    // distance drops below the presence threshold, then continuous ranging is
-    // started. Detection is now interrupt-driven — no polling loop.
-    if (tofBottomReady) {
-        configureToFInterrupt(tofBottom, configuredDistanceBottomMm);
-        tofBottom.startContinuous(VL53L0X_INTERMEASUREMENT_MS);
-        pinMode(VL53L0X_IRQ_BOTTOM, INPUT_PULLUP);
-        Serial.printf("[🔔] Bottom sensor → interrupt on GPIO %d (threshold %lumm)\n",
-                      VL53L0X_IRQ_BOTTOM, configuredDistanceBottomMm);
-    }
-    if (tofTopReady) {
-        configureToFInterrupt(tofTop, configuredDistanceTopMm);
-        tofTop.startContinuous(VL53L0X_INTERMEASUREMENT_MS);
-        pinMode(VL53L0X_IRQ_TOP, INPUT_PULLUP);
-        Serial.printf("[🔔] Top sensor → interrupt on GPIO %d (threshold %lumm)\n",
-                      VL53L0X_IRQ_TOP, configuredDistanceTopMm);
-    }
-
-    // BH1750 lux sensor init
-    if (!lightMeter.begin(LIGHT_SENSOR_MODE, 0x23, &Wire)) {
-        Serial.println("[✗] BH1750 not found — check wiring");
-    } else {
-        Serial.println("[✓] BH1750 ready");
-    }
+    // Push the configured presence thresholds to the ToF nodes (they may have
+    // been changed via the dashboard and persisted in NVS).
+    canSendThreshold(true,  (uint16_t)configuredDistanceBottomMm);
+    canSendThreshold(false, (uint16_t)configuredDistanceTopMm);
 
     // PWM setup for LED MOSFET (8-bit, 5 kHz — silent, smooth fade)
     ledcAttach(LED_MOSFET_PIN, PWM_FREQ, PWM_RES);
@@ -286,27 +208,13 @@ void loop() {
         syncSunset();
     }
 
-    // ── ToF presence (interrupt-driven) + presence timeout ──
-    // VL53L0X presence is handled by hardware interrupts, not polling. The ISRs
-    // latch flags that are consumed here; the presence timeout (turn the lights
-    // off after the configured duration) also runs every loop.
-    processTofInterrupts();
-
-    // ── Ambient light (BH1750) polling (configurable interval, default 5s) ──
-    // The ToF sensors no longer need polling; only the lux sensor is read on a
-    // cadence, keeping the web server fully responsive.
-    static unsigned long lastLuxPoll = 0;
-    unsigned long luxPollMs = configuredPollIntervalSec * 1000UL;
-    if (lastLuxPoll == 0 || now - lastLuxPoll >= luxPollMs) {
-        lastLuxPoll = now;
-        readLux();
-    }
+    // ── CAN: consume sensor frames from the smart-sensor nodes ──
+    // Each node publishes distance/presence/lux on the CAN bus; canPoll()
+    // updates presence + distance + lux and runs the presence timeout.
+    canPoll();
 
     // ── Decision logic + light control (every loop — keeps override responsive) ──
     setLights(evaluate());
-
-    // ── Arm/disarm presence interrupts based on time + light state ──
-    updateInterrupts();
 
     // ── PWM fade tick (fixed cadence → smooth fade regardless of polling) ──
     static unsigned long lastFadeTick = 0;
@@ -541,72 +449,88 @@ void syncSunset() {
 }
 
 // ═════════════════════════════════════════════════
-// Sensors — VL53L0X ToF (interrupt-driven) + BH1750
+// CAN — receive sensor data from the smart-sensor nodes
 // ═════════════════════════════════════════════════
 
-// ── VL53L0X interrupt ISRs (run on falling edge of GPIO1) ──
-// Active-low interrupt: the sensor pulls GPIO1 LOW when the distance drops below
-// the presence threshold. Keep these tiny — they only latch a flag; the I²C read
-// that fetches the actual range happens in the main loop.
-void IRAM_ATTR onTofBottomIrq() { irqBottomTriggered = true; }
-void IRAM_ATTR onTofTopIrq()    { irqTopTriggered    = true; }
+// ── Initialise TWAI (CAN) with the SN65HVD230 transceiver ──
+void canSetup() {
+    twai_general_config_t g = TWAI_GENERAL_CONFIG_DEFAULT(
+        (gpio_num_t)CAN_TX, (gpio_num_t)CAN_RX, TWAI_MODE_NORMAL);
+    twai_timing_config_t t = TWAI_TIMING_CONFIG_500KBITS();
+    twai_filter_config_t f = TWAI_FILTER_CONFIG_ACCEPT_ALL();
 
-// ── Configure a VL53L0X to fire GPIO1 when distance < threshold ──
-// Writes the low-distance threshold and sets GPIO1 to "interrupt on range below
-// low threshold" (active LOW). Register semantics follow the ST VL53L0X API:
-//   * SYSTEM_THRESH_LOW / HIGH are the distance thresholds (the firmware applies
-//     a x2 to the stored value, so we store mm/2).
-//   * SYSTEM_INTERRUPT_CONFIG_GPIO = 0x01 → THRESHOLD_CROSSED_LOW functionality.
-//   * GPIO_HV_MUX_ACTIVE_HIGH bit 4 cleared → active-low polarity.
-void applyToFThreshold(VL53L0X &sensor, unsigned long thresholdMm) {
-    uint16_t low = (uint16_t)(thresholdMm / 2);
-    sensor.writeReg16Bit(VL53L0X::SYSTEM_THRESH_LOW,  low);
-    sensor.writeReg16Bit(VL53L0X::SYSTEM_THRESH_HIGH, 0);   // high threshold disabled
-}
-
-void configureToFInterrupt(VL53L0X &sensor, unsigned long thresholdMm) {
-    applyToFThreshold(sensor, thresholdMm);
-    sensor.writeReg(VL53L0X::SYSTEM_INTERRUPT_CONFIG_GPIO, 0x01); // THRESHOLD_CROSSED_LOW
-    uint8_t hv = sensor.readReg(VL53L0X::GPIO_HV_MUX_ACTIVE_HIGH);
-    sensor.writeReg(VL53L0X::GPIO_HV_MUX_ACTIVE_HIGH, hv & 0xEF); // active-low (clear bit 4)
-    sensor.writeReg(VL53L0X::SYSTEM_INTERRUPT_CLEAR, 0x01);       // clear any pending IRQ
-}
-
-// ── Handle a single ToF interrupt ──
-// Reads the range that triggered the interrupt, re-arms the sensor, and updates
-// presence state. Ghost/crosstalk readings below VL53L0X_MIN_PRESENCE_MM are
-// ignored (the same floor the old polling code enforced).
-void handleTofInterrupt(VL53L0X &sensor, bool &presenceFlag,
-                        uint16_t &distance, unsigned long thresholdMm,
-                        const char* name) {
-    distance = sensor.readReg16Bit(VL53L0X::RESULT_RANGE_STATUS + 10);
-    sensor.writeReg(VL53L0X::SYSTEM_INTERRUPT_CLEAR, 0x01);  // re-arm for next crossing
-
-    unsigned long now = millis();
-    bool inRange = (distance >= VL53L0X_MIN_PRESENCE_MM && distance < thresholdMm);
-    if (inRange && now >= motionDebounceUntil) {
-        if (!presenceFlag) {
-            Serial.printf("[👣] Presence detected — %s! (%u mm)\n", name, distance);
-        }
-        presenceFlag = true;
-        lastMotionTime = now;
-        motionDebounceUntil = now + MOTION_DEBOUNCE_MS;
+    if (twai_driver_install(&g, &t, &f) == ESP_OK && twai_start() == ESP_OK) {
+        Serial.println("[CAN] bus started — waiting for sensor nodes");
+    } else {
+        Serial.println("[CAN] driver install/start failed — check transceiver wiring");
     }
 }
 
-// ── Consume latched interrupt flags (called every loop) ──
-void processTofInterrupts() {
+// ── Should a presence report be accepted right now? ──
+// Mirrors the old interrupt gating: presence is acted on only at night, while
+// the lights are OFF, and in AUTO mode. While the lights are ON we ignore new
+// presence so the countdown runs to completion instead of being reset.
+bool canAcceptPresence() {
+    return isNightNow() && !lightsOn && (overrideMode == 0);
+}
+
+// ── Publish a presence-threshold change to a ToF node ──
+void canSendThreshold(bool bottom, uint16_t mm) {
+    twai_message_t msg;
+    msg.identifier = CAN_ID_SET_THRESHOLD;
+    msg.extd = 0;
+    msg.rtr = 0;
+    msg.data_length_code = 3;
+    msg.data[0] = bottom ? CAN_NODE_BOTTOM : CAN_NODE_TOP;
+    msg.data[1] = (uint8_t)(mm & 0xFF);
+    msg.data[2] = (uint8_t)((mm >> 8) & 0xFF);
+    twai_transmit(&msg, pdMS_TO_TICKS(10));
+}
+
+// ── Poll the CAN bus and update presence / distance / lux ──
+// Replaces both the interrupt-driven ToF presence handling and the BH1750
+// polling. Each node publishes continuously; the main consumes frames here.
+void canPoll() {
     bool sessionWasActive = (presenceBottom || presenceTop);
 
-    if (irqBottomTriggered) {
-        irqBottomTriggered = false;
-        handleTofInterrupt(tofBottom, presenceBottom, distanceBottom,
-                           configuredDistanceBottomMm, "bottom");
-    }
-    if (irqTopTriggered) {
-        irqTopTriggered = false;
-        handleTofInterrupt(tofTop, presenceTop, distanceTop,
-                           configuredDistanceTopMm, "top");
+    twai_message_t msg;
+    while (twai_receive(&msg, pdMS_TO_TICKS(0)) == ESP_OK) {
+        switch (msg.identifier) {
+            case CAN_ID_DIST_BOTTOM:
+            case CAN_ID_DIST_TOP: {
+                bool pres; uint16_t mm; bool valid;
+                decode_distance(msg.data, pres, mm, valid);
+                bool isBottom = (msg.identifier == CAN_ID_DIST_BOTTOM);
+                if (isBottom) {
+                    if (valid) distanceBottom = mm;
+                    if (pres && canAcceptPresence() && (millis() >= motionDebounceUntil)) {
+                        if (!presenceBottom) Serial.printf("[👣] Presence detected — bottom! (%u mm)\n", mm);
+                        presenceBottom = true;
+                        lastMotionTime = millis();
+                        motionDebounceUntil = millis() + MOTION_DEBOUNCE_MS;
+                    }
+                } else {
+                    if (valid) distanceTop = mm;
+                    if (pres && canAcceptPresence() && (millis() >= motionDebounceUntil)) {
+                        if (!presenceTop) Serial.printf("[👣] Presence detected — top! (%u mm)\n", mm);
+                        presenceTop = true;
+                        lastMotionTime = millis();
+                        motionDebounceUntil = millis() + MOTION_DEBOUNCE_MS;
+                    }
+                }
+                break;
+            }
+            case CAN_ID_LUX: {
+                lux = decode_lux(msg.data);
+                break;
+            }
+            case CAN_ID_HEARTBEAT: {
+                // node alive — optionally track node liveness here
+                break;
+            }
+            default:
+                break;
+        }
     }
 
     // Lock the light duration on the idle -> active transition.
@@ -617,23 +541,11 @@ void processTofInterrupts() {
     }
 
     // Presence timeout: clear both when no presence for the configured duration.
-    // Use a fresh millis() here — the value captured at function entry would
-    // predate the lastMotionTime update made inside handleTofInterrupt(), so
-    // subtracting it underflows (unsigned) and clears presence the very instant
-    // it is detected.
     if ((presenceBottom || presenceTop) && (millis() - lastMotionTime > activeDurationSec * 1000UL)) {
         if (presenceBottom) Serial.println("[👣] Presence timeout — bottom");
         if (presenceTop)    Serial.println("[👣] Presence timeout — top");
         presenceBottom = false;
         presenceTop    = false;
-    }
-}
-
-// ── Ambient light (BH1750) — still polled (lux changes slowly) ──
-void readLux() {
-    if (lightMeter.measurementReady()) {
-        lux = lightMeter.readLightLevel();
-        if (lux < 0) lux = 0;
     }
 }
 
@@ -649,49 +561,6 @@ bool isNightNow() {
     int sunriseMin = minutesOfDay(sunriseEpoch, localUtcOffsetSec);
     int sunsetMin  = minutesOfDay(sunsetEpoch,  localUtcOffsetSec);
     return (nowMin >= sunsetMin) || (nowMin < sunriseMin);
-}
-
-// ── Arm / disarm presence interrupts ──
-// Interrupts are armed only when it is night AND the lights are OFF AND the unit
-// is in AUTO mode. While the lights are ON (or during the day) the interrupts are
-// detached, so continued presence on the stairs can't reset the countdown — the
-// lights time out after the configured duration and the interrupt is re-armed.
-void armInterrupts() {
-    if (interruptsArmed) return;
-    irqBottomTriggered = false;
-    irqTopTriggered    = false;
-
-    if (tofBottomReady) {
-        tofBottom.writeReg(VL53L0X::SYSTEM_INTERRUPT_CLEAR, 0x01);  // clear stale latch
-        attachInterrupt(digitalPinToInterrupt(VL53L0X_IRQ_BOTTOM), onTofBottomIrq, FALLING);
-        if (digitalRead(VL53L0X_IRQ_BOTTOM) == LOW) irqBottomTriggered = true;  // already present
-    }
-    if (tofTopReady) {
-        tofTop.writeReg(VL53L0X::SYSTEM_INTERRUPT_CLEAR, 0x01);
-        attachInterrupt(digitalPinToInterrupt(VL53L0X_IRQ_TOP), onTofTopIrq, FALLING);
-        if (digitalRead(VL53L0X_IRQ_TOP) == LOW) irqTopTriggered = true;
-    }
-    interruptsArmed = true;
-    Serial.println("[🔔] Presence interrupts armed");
-}
-
-void disarmInterrupts() {
-    if (!interruptsArmed) return;
-    if (tofBottomReady) detachInterrupt(digitalPinToInterrupt(VL53L0X_IRQ_BOTTOM));
-    if (tofTopReady)    detachInterrupt(digitalPinToInterrupt(VL53L0X_IRQ_TOP));
-    irqBottomTriggered = false;
-    irqTopTriggered    = false;
-    interruptsArmed = false;
-    Serial.println("[🔕] Presence interrupts disarmed");
-}
-
-void updateInterrupts() {
-    bool shouldArm = isNightNow() && !lightsOn && (overrideMode == 0);
-    if (shouldArm && !interruptsArmed) {
-        armInterrupts();
-    } else if (!shouldArm && interruptsArmed) {
-        disarmInterrupts();
-    }
 }
 
 // ═════════════════════════════════════════════════
@@ -1302,10 +1171,10 @@ void handleDistance() {
 
         if (isBottom) {
             configuredDistanceBottomMm = (unsigned long)newDist;
-            if (tofBottomReady) applyToFThreshold(tofBottom, configuredDistanceBottomMm);
+            canSendThreshold(true, (uint16_t)configuredDistanceBottomMm);
         } else {
             configuredDistanceTopMm = (unsigned long)newDist;
-            if (tofTopReady) applyToFThreshold(tofTop, configuredDistanceTopMm);
+            canSendThreshold(false, (uint16_t)configuredDistanceTopMm);
         }
 
         Serial.printf("[⚙] Distance %s set to %lumm (HTTP)\n",
