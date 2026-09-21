@@ -1,0 +1,119 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1040" height="820" viewBox="0 0 1040 820" font-family="DejaVu Sans, Arial, sans-serif">
+  <rect width="1040" height="820" fill="#ffffff"/>
+
+  <text x="520" y="34" font-size="22" font-weight="bold" text-anchor="middle" fill="#111">Staircase Light Controller — UART / mmWave Option</text>
+  <text x="520" y="56" font-size="13" text-anchor="middle" fill="#555">2× HLK-LD2410B radar (presence) + LDR (ambient light) · no I²C bus · ESP32-S3</text>
+
+  <!-- ============ SYSTEM OVERVIEW ============ -->
+  <text x="30" y="88" font-size="16" font-weight="bold" fill="#111">1 · System overview</text>
+
+  <!-- ESP32-S3 main box (center) -->
+  <rect x="380" y="110" width="280" height="200" rx="8" fill="#ebf4ff" stroke="#2c7be5" stroke-width="2.5"/>
+  <text x="520" y="140" font-size="15" font-weight="bold" text-anchor="middle" fill="#1a56a8">ESP32-S3 SuperMini</text>
+  <text x="520" y="158" font-size="10" text-anchor="middle" fill="#555">(main controller)</text>
+  <g font-size="11" fill="#333">
+    <text x="396" y="185">GPIO 4 · radar OUT (bottom)</text>
+    <text x="396" y="207">GPIO 6 · radar OUT (top)</text>
+    <text x="396" y="229">GPIO 7 · UART RX (bottom)</text>
+    <text x="396" y="251">GPIO 8 · UART RX (top)</text>
+    <text x="396" y="273">GPIO 1 · ADC (LDR)</text>
+    <text x="396" y="295">GPIO 5 · LED MOSFET (PWM)</text>
+  </g>
+
+  <!-- Radar bottom (left) -->
+  <rect x="90" y="110" width="190" height="120" rx="8" fill="#f0fff4" stroke="#38a169" stroke-width="2"/>
+  <text x="185" y="135" font-size="13" font-weight="bold" text-anchor="middle" fill="#276749">HLK-LD2410B</text>
+  <text x="185" y="151" font-size="10" text-anchor="middle" fill="#555">mmWave radar · bottom</text>
+  <g font-size="10" fill="#333">
+    <text x="106" y="175">OUT  → GPIO 4</text>
+    <text x="106" y="191">TX   → GPIO 7 (RX)</text>
+    <text x="106" y="207">VCC  → 5 V</text>
+    <text x="106" y="223">GND  → GND</text>
+  </g>
+
+  <!-- Radar top (left, below) -->
+  <rect x="90" y="250" width="190" height="120" rx="8" fill="#f0fff4" stroke="#38a169" stroke-width="2"/>
+  <text x="185" y="275" font-size="13" font-weight="bold" text-anchor="middle" fill="#276749">HLK-LD2410B</text>
+  <text x="185" y="291" font-size="10" text-anchor="middle" fill="#555">mmWave radar · top</text>
+  <g font-size="10" fill="#333">
+    <text x="106" y="315">OUT  → GPIO 6</text>
+    <text x="106" y="331">TX   → GPIO 8 (RX)</text>
+    <text x="106" y="347">VCC  → 5 V</text>
+    <text x="106" y="363">GND  → GND</text>
+  </g>
+
+  <!-- LDR (right) -->
+  <rect x="760" y="110" width="200" height="90" rx="8" fill="#fffaf0" stroke="#d69e2e" stroke-width="2"/>
+  <text x="860" y="135" font-size="13" font-weight="bold" text-anchor="middle" fill="#975a16">LDR + 10 kΩ</text>
+  <text x="860" y="151" font-size="10" text-anchor="middle" fill="#555">ambient light (divider)</text>
+  <g font-size="10" fill="#333">
+    <text x="776" y="172">tap → GPIO 1 (ADC)</text>
+    <text x="776" y="188">3V3 → LDR → tap → 10kΩ → GND</text>
+  </g>
+
+  <!-- LED + MOSFET (right, below) -->
+  <rect x="760" y="220" width="200" height="90" rx="8" fill="#fdf2f8" stroke="#d53f8c" stroke-width="2"/>
+  <text x="860" y="245" font-size="13" font-weight="bold" text-anchor="middle" fill="#97266d">IRLZ44N + 12 V LED</text>
+  <g font-size="10" fill="#333">
+    <text x="776" y="266">GPIO 5 → gate (10 kΩ pulldown)</text>
+    <text x="776" y="282">12 V → strip → drain · source → GND</text>
+  </g>
+
+  <!-- Connections radar -> ESP32 -->
+  <g stroke="#38a169" stroke-width="1.6" fill="none">
+    <line x1="280" y1="172" x2="380" y2="181"/>
+    <line x1="280" y1="188" x2="380" y2="225"/>
+    <line x1="280" y1="312" x2="380" y2="203"/>
+    <line x1="280" y1="328" x2="380" y2="247"/>
+  </g>
+  <!-- LDR -> ESP32 -->
+  <line x1="760" y1="169" x2="660" y2="269" stroke="#d69e2e" stroke-width="1.6"/>
+  <!-- MOSFET -> ESP32 -->
+  <line x1="760" y1="263" x2="660" y2="291" stroke="#d53f8c" stroke-width="1.6"/>
+
+  <!-- ============ RADAR DETAIL ============ -->
+  <text x="30" y="440" font-size="16" font-weight="bold" fill="#111">2 · Radar wiring (one HLK-LD2410B)</text>
+
+  <rect x="90" y="460" width="220" height="170" rx="8" fill="#f0fff4" stroke="#38a169" stroke-width="2"/>
+  <text x="200" y="486" font-size="13" font-weight="bold" text-anchor="middle" fill="#276749">HLK-LD2410B</text>
+  <g font-size="11" fill="#333">
+    <text x="106" y="514">VCC (5 V)</text>
+    <text x="106" y="536">GND</text>
+    <text x="106" y="558">OUT  → presence (HIGH = present)</text>
+    <text x="106" y="580">TX   → UART (distance cm)</text>
+    <text x="106" y="602">RX   → (config, unused)</text>
+  </g>
+  <text x="200" y="624" font-size="9" text-anchor="middle" fill="#38a169" font-style="italic">config sensitivity via HLK app / UART</text>
+
+  <rect x="480" y="460" width="260" height="110" rx="8" fill="#ebf4ff" stroke="#2c7be5" stroke-width="2"/>
+  <text x="610" y="486" font-size="13" font-weight="bold" text-anchor="middle" fill="#1a56a8">ESP32-S3 (this node)</text>
+  <g font-size="11" fill="#333">
+    <text x="496" y="514">GPIO 4/6  ← OUT</text>
+    <text x="496" y="536">GPIO 7/8  ← TX</text>
+    <text x="496" y="558">5 V / GND</text>
+  </g>
+  <line x1="310" y1="555" x2="480" y2="511" stroke="#38a169" stroke-width="1.8"/>
+  <line x1="310" y1="577" x2="480" y2="533" stroke="#38a169" stroke-width="1.8"/>
+
+  <!-- ============ LDR DIVIDER ============ -->
+  <text x="30" y="680" font-size="16" font-weight="bold" fill="#111">3 · LDR ambient-light divider</text>
+
+  <g stroke="#333" stroke-width="2">
+    <line x1="130" y1="720" x2="240" y2="720"/>
+    <line x1="240" y1="720" x2="300" y2="720"/>
+    <line x1="300" y1="720" x2="300" y2="770"/>
+    <line x1="300" y1="770" x2="240" y2="770"/>
+    <line x1="240" y1="770" x2="130" y2="770"/>
+  </g>
+  <text x="110" y="724" font-size="11" fill="#333" text-anchor="end">3V3</text>
+  <text x="130" y="715" font-size="10" fill="#d69e2e">LDR</text>
+  <text x="245" y="715" font-size="10" fill="#d69e2e">tap</text>
+  <text x="310" y="760" font-size="11" fill="#333">→ GPIO 1 (ADC)</text>
+  <text x="250" y="788" font-size="10" fill="#555">10 kΩ</text>
+  <text x="110" y="774" font-size="11" fill="#333" text-anchor="end">GND</text>
+  <text x="470" y="720" font-size="11" fill="#555">brighter = higher ADC → lux = (ADC/4095) × LDR_MAX_LUX</text>
+  <text x="470" y="742" font-size="11" fill="#555">calibrate LUX_THRESHOLD in config.h for "dark enough"</text>
+
+  <!-- Legend -->
+  <rect x="60" y="790" width="920" height="0" fill="none"/>
+</svg>

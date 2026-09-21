@@ -1,25 +1,19 @@
 /**
- * Staircase Light Controller — ESP32-S3 SuperMini
- * ===============================================
+ * Staircase Light Controller — ESP32-S3 SuperMini (mmWave radar + LDR option)
+ * ===========================================================================
  *
  * Automatically controls a 12V LED strip on a 5m staircase based on:
- *   1. Presence detection (VL53L0X ToF laser distance sensors)
- *   2. Ambient light level (BH1750 I²C lux sensor)
+ *   1. Presence detection (HLK-LD2410B mmWave radar — moving OR stationary)
+ *   2. Ambient light level (LDR photoresistor)
  *   3. Time of day vs sunset (HTTP APIs)
  *
  * Lights turn ON when: person detected on stairs AND it's dark AND past sunset.
- * Presence is detected via VL53L0X hardware interrupts (GPIO1 threshold output),
- * not polling. Interrupts are armed only after sunset and while the lights are
- * OFF; they are disarmed while the lights are ON and re-armed when they go off,
- * so the countdown is never reset by continued presence on the stairs.
- *
- * VL53L0X advantages over HC-SR501 PIR:
- *   - Detects presence even when person is still (no movement needed)
- *   - Works in hot environments (PIR fails when ambient ≈ body temp)
- *   - Provides actual distance in mm for richer dashboard data
+ * Presence comes from each radar's OUT pin (HIGH = present) — no I²C bus, no
+ * address collision, no pull-up tuning. The radar detects a person who is
+ * completely still (micro-motion), which PIR cannot.
  *
  * Web Dashboard: http://<esp32-ip>/
- *   - Live status: lux, distance (cm), lights, time, sunset
+ *   - Live status: lux (scaled), distance (cm), lights, time, sunset
  *   - Manual override: force ON / OFF / AUTO
  *
  * APIs used:
@@ -28,9 +22,9 @@
  *
  * Hardware:
  *   - ESP32-S3 SuperMini
- *   - VL53L0X ToF distance sensor — bottom of stairs (I²C addr 0x29, XSHUT GPIO 4, IRQ GPIO 7)
- *   - VL53L0X ToF distance sensor — top of stairs (I²C addr 0x30, XSHUT GPIO 6, IRQ GPIO 8)
- *   - BH1750 ambient light sensor (I²C: SDA 12, SCL 13)
+ *   - HLK-LD2410B mmWave radar — bottom (OUT GPIO 4, UART RX GPIO 7)
+ *   - HLK-LD2410B mmWave radar — top    (OUT GPIO 6, UART RX GPIO 8)
+ *   - LDR photoresistor divider (ADC GPIO 1)
  *   - IRLZ44N MOSFET switching 12V LED strip (GPIO 5)
  *   - 12V DC power supply (≥6A for 5m strip)
  */
@@ -38,18 +32,16 @@
 #include "config.h"
 #include <WiFi.h>
 #include <HTTPClient.h>
-#include <Wire.h>
-#include <BH1750.h>
-#include <VL53L0X.h>
 #include <ArduinoJson.h>
 #include <WebServer.h>
 #include <time.h>
 #include <Preferences.h>
 
+// Feature flag: read radar distance (cm) over UART for the dashboard.
+// Set to 0 if you only want the presence OUT pin (simplest wiring).
+#define USE_RADAR_UART  1
+
 // ── Objects ─────────────────────────────────────
-BH1750 lightMeter;
-VL53L0X tofBottom;   // Bottom of stairs (I²C addr 0x29)
-VL53L0X tofTop;      // Top of stairs (I²C addr 0x30)
 WebServer server(80);
 Preferences prefs;
 
@@ -71,18 +63,11 @@ int           localUtcOffsetSec = -6 * 3600; // Updated from time API (Mexico Ci
 const unsigned long TIME_RESYNC_MS   = TIME_RESYNC_MIN  * 60000UL;
 const unsigned long SUNSET_RESYNC_MS = SUNSET_RESYNC_MIN * 60000UL;
 
-// ── Presence tracking (VL53L0X) ──────────────────
+// ── Presence tracking (via mmWave radar OUT pins) ──
 bool     presenceBottom  = false;
 bool     presenceTop     = false;
-uint16_t distanceBottom  = 0;        // mm
-uint16_t distanceTop     = 0;        // mm
-bool     tofBottomReady  = false;    // Bottom sensor initialized
-bool     tofTopReady     = false;    // Top sensor initialized
-
-// ── Interrupt-driven presence (VL53L0X GPIO1) ────
-volatile bool irqBottomTriggered = false;  // Set by bottom-sensor ISR
-volatile bool irqTopTriggered    = false;  // Set by top-sensor ISR
-bool     interruptsArmed  = false;   // True while presence interrupts are attached
+uint16_t distanceBottom  = 0;        // cm (from radar UART, 0 if not parsed)
+uint16_t distanceTop     = 0;        // cm
 unsigned long lastMotionTime = 0;
 unsigned long motionDebounceUntil = 0;
 
@@ -162,83 +147,21 @@ void setup() {
     pinMode(STATUS_LED_PIN, OUTPUT);
     digitalWrite(STATUS_LED_PIN, LOW);
 
-    // I²C for BH1750 + VL53L0X (shared bus)
-    Wire.begin(I2C_SDA, I2C_SCL);
+    // ── Presence radars (HLK-LD2410B) + LDR ambient light ──
+    // Each radar's OUT pin is HIGH when a person is present (moving or
+    // stationary). The LDR divider is read on the ADC. No I²C bus, no address
+    // collision, no pull-up tuning — the whole point of this option.
+    pinMode(RADAR_BOTTOM_PIN, INPUT_PULLDOWN);
+    pinMode(RADAR_TOP_PIN, INPUT_PULLDOWN);
+    analogReadResolution(12);
+    pinMode(LDR_PIN, INPUT);
 
-    // ── VL53L0X ToF sensor init (two sensors on same I²C bus) ──
-    // Strategy: hold both in shutdown, then wake one at a time. The FIRST
-    // sensor woken MUST be moved off the default 0x29 address before the
-    // second wakes — otherwise both boot at 0x29 and a setAddress() write
-    // hits both (address collision → constant 65535 readings).
-    pinMode(VL53L0X_XSHUT_BOTTOM, OUTPUT);
-    pinMode(VL53L0X_XSHUT_TOP, OUTPUT);
-    digitalWrite(VL53L0X_XSHUT_BOTTOM, LOW);  // Hold both in shutdown
-    digitalWrite(VL53L0X_XSHUT_TOP, LOW);
-    delay(10);
-
-    // Init TOP first: wake it at 0x29, then move it to the alternate address
-    // (0x30) so the default 0x29 is free for the bottom sensor.
-    digitalWrite(VL53L0X_XSHUT_TOP, HIGH);
-    delay(10);
-    if (tofTop.init(true)) {  // true = use 2.8V mode (more stable)
-        tofTop.setAddress(VL53L0X_ADDR_ALT);
-        tofTop.setTimeout(500);
-        tofTop.setMeasurementTimingBudget(VL53L0X_TIMING_BUDGET_MS * 1000UL);
-        Serial.printf("[✓] VL53L0X top ready (addr 0x%02X)\n", tofTop.getAddress());
-        tofTopReady = true;
-    } else {
-        Serial.println("[✗] VL53L0X top not found — check wiring");
-    }
-
-    // Init BOTTOM second: it boots at the default 0x29, now free.
-    digitalWrite(VL53L0X_XSHUT_BOTTOM, HIGH);
-    delay(10);
-    if (tofBottom.init(true)) {
-        tofBottom.setAddress(VL53L0X_ADDR_DEFAULT);
-        tofBottom.setTimeout(500);
-        tofBottom.setMeasurementTimingBudget(VL53L0X_TIMING_BUDGET_MS * 1000UL);
-        Serial.printf("[✓] VL53L0X bottom ready (addr 0x%02X)\n", tofBottom.getAddress());
-        tofBottomReady = true;
-    } else {
-        Serial.println("[✗] VL53L0X bottom not found — check wiring");
-    }
-
-    // ── Post-init reachability check ──
-    // Verify each sensor actually answers at its assigned address. This catches
-    // an address collision (a sensor silently moved to the wrong address would
-    // otherwise read as a constant 65535).
-    if (tofBottom.readReg(VL53L0X::IDENTIFICATION_MODEL_ID) != 0xEE) {
-        Serial.println("[⚠] Bottom sensor not reachable at 0x29 — possible address collision");
-    }
-    if (tofTop.readReg(VL53L0X::IDENTIFICATION_MODEL_ID) != 0xEE) {
-        Serial.println("[⚠] Top sensor not reachable at 0x30 — possible address collision");
-    }
-
-    // ── Configure VL53L0X GPIO1 as a presence interrupt ──
-    // Each sensor's GPIO1 pin is set to fire (active LOW) whenever the measured
-    // distance drops below the presence threshold, then continuous ranging is
-    // started. Detection is now interrupt-driven — no polling loop.
-    if (tofBottomReady) {
-        configureToFInterrupt(tofBottom, configuredDistanceBottomMm);
-        tofBottom.startContinuous(VL53L0X_INTERMEASUREMENT_MS);
-        pinMode(VL53L0X_IRQ_BOTTOM, INPUT_PULLUP);
-        Serial.printf("[🔔] Bottom sensor → interrupt on GPIO %d (threshold %lumm)\n",
-                      VL53L0X_IRQ_BOTTOM, configuredDistanceBottomMm);
-    }
-    if (tofTopReady) {
-        configureToFInterrupt(tofTop, configuredDistanceTopMm);
-        tofTop.startContinuous(VL53L0X_INTERMEASUREMENT_MS);
-        pinMode(VL53L0X_IRQ_TOP, INPUT_PULLUP);
-        Serial.printf("[🔔] Top sensor → interrupt on GPIO %d (threshold %lumm)\n",
-                      VL53L0X_IRQ_TOP, configuredDistanceTopMm);
-    }
-
-    // BH1750 lux sensor init
-    if (!lightMeter.begin(LIGHT_SENSOR_MODE, 0x23, &Wire)) {
-        Serial.println("[✗] BH1750 not found — check wiring");
-    } else {
-        Serial.println("[✓] BH1750 ready");
-    }
+#if USE_RADAR_UART
+    // Radar UART (distance in cm for the dashboard) — receive-only.
+    Serial1.begin(RADAR_UART_BAUD, SERIAL_8N1, RADAR_BOTTOM_RX, -1);
+    Serial2.begin(RADAR_UART_BAUD, SERIAL_8N1, RADAR_TOP_RX, -1);
+    Serial.println("[📡] Radar UART enabled (distance reporting)");
+#endif
 
     // PWM setup for LED MOSFET (8-bit, 5 kHz — silent, smooth fade)
     ledcAttach(LED_MOSFET_PIN, PWM_FREQ, PWM_RES);
@@ -286,15 +209,10 @@ void loop() {
         syncSunset();
     }
 
-    // ── ToF presence (interrupt-driven) + presence timeout ──
-    // VL53L0X presence is handled by hardware interrupts, not polling. The ISRs
-    // latch flags that are consumed here; the presence timeout (turn the lights
-    // off after the configured duration) also runs every loop.
-    processTofInterrupts();
+    // ── Presence (mmWave radar OUT pins) + presence timeout ──
+    processPresence();
 
-    // ── Ambient light (BH1750) polling (configurable interval, default 5s) ──
-    // The ToF sensors no longer need polling; only the lux sensor is read on a
-    // cadence, keeping the web server fully responsive.
+    // ── Ambient light (LDR) polling (configurable interval, default 5s) ──
     static unsigned long lastLuxPoll = 0;
     unsigned long luxPollMs = configuredPollIntervalSec * 1000UL;
     if (lastLuxPoll == 0 || now - lastLuxPoll >= luxPollMs) {
@@ -302,11 +220,13 @@ void loop() {
         readLux();
     }
 
+#if USE_RADAR_UART
+    // ── Radar distance (cm) for the dashboard ──
+    readRadarDistance();
+#endif
+
     // ── Decision logic + light control (every loop — keeps override responsive) ──
     setLights(evaluate());
-
-    // ── Arm/disarm presence interrupts based on time + light state ──
-    updateInterrupts();
 
     // ── PWM fade tick (fixed cadence → smooth fade regardless of polling) ──
     static unsigned long lastFadeTick = 0;
@@ -541,72 +461,36 @@ void syncSunset() {
 }
 
 // ═════════════════════════════════════════════════
-// Sensors — VL53L0X ToF (interrupt-driven) + BH1750
+// Sensors — mmWave radar presence (HLK-LD2410B) + LDR
 // ═════════════════════════════════════════════════
 
-// ── VL53L0X interrupt ISRs (run on falling edge of GPIO1) ──
-// Active-low interrupt: the sensor pulls GPIO1 LOW when the distance drops below
-// the presence threshold. Keep these tiny — they only latch a flag; the I²C read
-// that fetches the actual range happens in the main loop.
-void IRAM_ATTR onTofBottomIrq() { irqBottomTriggered = true; }
-void IRAM_ATTR onTofTopIrq()    { irqTopTriggered    = true; }
-
-// ── Configure a VL53L0X to fire GPIO1 when distance < threshold ──
-// Writes the low-distance threshold and sets GPIO1 to "interrupt on range below
-// low threshold" (active LOW). Register semantics follow the ST VL53L0X API:
-//   * SYSTEM_THRESH_LOW / HIGH are the distance thresholds (the firmware applies
-//     a x2 to the stored value, so we store mm/2).
-//   * SYSTEM_INTERRUPT_CONFIG_GPIO = 0x01 → THRESHOLD_CROSSED_LOW functionality.
-//   * GPIO_HV_MUX_ACTIVE_HIGH bit 4 cleared → active-low polarity.
-void applyToFThreshold(VL53L0X &sensor, unsigned long thresholdMm) {
-    uint16_t low = (uint16_t)(thresholdMm / 2);
-    sensor.writeReg16Bit(VL53L0X::SYSTEM_THRESH_LOW,  low);
-    sensor.writeReg16Bit(VL53L0X::SYSTEM_THRESH_HIGH, 0);   // high threshold disabled
+// ── Should a presence report be accepted right now? ──
+// Mirrors the old interrupt gating: presence is acted on only at night, while
+// the lights are OFF, and in AUTO mode — so continued presence while the lights
+// are ON doesn't reset the countdown (the lights time out and re-arm).
+bool canAcceptPresence() {
+    return isNightNow() && !lightsOn && (overrideMode == 0);
 }
 
-void configureToFInterrupt(VL53L0X &sensor, unsigned long thresholdMm) {
-    applyToFThreshold(sensor, thresholdMm);
-    sensor.writeReg(VL53L0X::SYSTEM_INTERRUPT_CONFIG_GPIO, 0x01); // THRESHOLD_CROSSED_LOW
-    uint8_t hv = sensor.readReg(VL53L0X::GPIO_HV_MUX_ACTIVE_HIGH);
-    sensor.writeReg(VL53L0X::GPIO_HV_MUX_ACTIVE_HIGH, hv & 0xEF); // active-low (clear bit 4)
-    sensor.writeReg(VL53L0X::SYSTEM_INTERRUPT_CLEAR, 0x01);       // clear any pending IRQ
-}
-
-// ── Handle a single ToF interrupt ──
-// Reads the range that triggered the interrupt, re-arms the sensor, and updates
-// presence state. Ghost/crosstalk readings below VL53L0X_MIN_PRESENCE_MM are
-// ignored (the same floor the old polling code enforced).
-void handleTofInterrupt(VL53L0X &sensor, bool &presenceFlag,
-                        uint16_t &distance, unsigned long thresholdMm,
-                        const char* name) {
-    distance = sensor.readReg16Bit(VL53L0X::RESULT_RANGE_STATUS + 10);
-    sensor.writeReg(VL53L0X::SYSTEM_INTERRUPT_CLEAR, 0x01);  // re-arm for next crossing
-
+// ── Process presence from the two radar OUT pins ──
+// Each radar's OUT pin is HIGH when a person is present (moving OR stationary).
+// Replaces the interrupt-driven VL53L0X presence handling entirely.
+void processPresence() {
+    bool sessionWasActive = (presenceBottom || presenceTop);
     unsigned long now = millis();
-    bool inRange = (distance >= VL53L0X_MIN_PRESENCE_MM && distance < thresholdMm);
-    if (inRange && now >= motionDebounceUntil) {
-        if (!presenceFlag) {
-            Serial.printf("[👣] Presence detected — %s! (%u mm)\n", name, distance);
-        }
-        presenceFlag = true;
+    bool accept = canAcceptPresence();
+
+    if (digitalRead(RADAR_BOTTOM_PIN) == HIGH && accept && now >= motionDebounceUntil) {
+        if (!presenceBottom) Serial.println("[👣] Presence detected — bottom!");
+        presenceBottom = true;
         lastMotionTime = now;
         motionDebounceUntil = now + MOTION_DEBOUNCE_MS;
     }
-}
-
-// ── Consume latched interrupt flags (called every loop) ──
-void processTofInterrupts() {
-    bool sessionWasActive = (presenceBottom || presenceTop);
-
-    if (irqBottomTriggered) {
-        irqBottomTriggered = false;
-        handleTofInterrupt(tofBottom, presenceBottom, distanceBottom,
-                           configuredDistanceBottomMm, "bottom");
-    }
-    if (irqTopTriggered) {
-        irqTopTriggered = false;
-        handleTofInterrupt(tofTop, presenceTop, distanceTop,
-                           configuredDistanceTopMm, "top");
+    if (digitalRead(RADAR_TOP_PIN) == HIGH && accept && now >= motionDebounceUntil) {
+        if (!presenceTop) Serial.println("[👣] Presence detected — top!");
+        presenceTop = true;
+        lastMotionTime = now;
+        motionDebounceUntil = now + MOTION_DEBOUNCE_MS;
     }
 
     // Lock the light duration on the idle -> active transition.
@@ -617,25 +501,70 @@ void processTofInterrupts() {
     }
 
     // Presence timeout: clear both when no presence for the configured duration.
-    // Use a fresh millis() here — the value captured at function entry would
-    // predate the lastMotionTime update made inside handleTofInterrupt(), so
-    // subtracting it underflows (unsigned) and clears presence the very instant
-    // it is detected.
     if ((presenceBottom || presenceTop) && (millis() - lastMotionTime > activeDurationSec * 1000UL)) {
         if (presenceBottom) Serial.println("[👣] Presence timeout — bottom");
         if (presenceTop)    Serial.println("[👣] Presence timeout — top");
         presenceBottom = false;
-        presenceTop    = false;
+        presenceTop = false;
     }
 }
 
-// ── Ambient light (BH1750) — still polled (lux changes slowly) ──
+// ── Ambient light (LDR photoresistor) ──
+// Reads the LDR divider and maps it to a rough 0..LDR_MAX_LUX scale. Exact lux
+// is not needed — only "is it dark enough?" — so a linear mapping plus a
+// calibrated LUX_THRESHOLD (see config.h) is sufficient.
 void readLux() {
-    if (lightMeter.measurementReady()) {
-        lux = lightMeter.readLightLevel();
-        if (lux < 0) lux = 0;
+    int adc = analogRead(LDR_PIN);             // 0..4095 (12-bit)
+    lux = (float)adc / 4095.0f * LDR_MAX_LUX;
+    if (lux < 0) lux = 0;
+}
+
+#if USE_RADAR_UART
+// ── Radar distance (cm) via UART — best-effort ──
+// Parses the HLK-LD2410 "report" frame:
+//   AA FF 03 00 <len:2 LE> <data...> 55 CC
+//   data[0] = target state (0 none, 1 moving, 2 stationary)
+//   data[1..2] = distance cm (LE) when state != 0
+// NOTE: frame layout can vary with firmware — verify against your unit; the
+// presence OUT pin is the source of truth for the lights regardless.
+struct RadarStream {
+    uint8_t  st = 0;         // 0..3 = header sync, 4 = len lo, 5 = len hi, 6 = data
+    uint16_t len = 0;
+    uint8_t  idx = 0;
+    uint8_t  buf[16];
+    uint16_t distance = 0;
+};
+
+RadarStream radarBottom, radarTop;
+
+void feedRadar(uint8_t which, uint8_t b) {
+    RadarStream &r = (which == 0) ? radarBottom : radarTop;
+    switch (r.st) {
+        case 0: r.st = (b == 0xAA) ? 1 : 0; break;
+        case 1: r.st = (b == 0xFF) ? 2 : 0; break;
+        case 2: r.st = (b == 0x03) ? 3 : 0; break;
+        case 3: r.st = (b == 0x00) ? 4 : 0; break;
+        case 4: r.len = b; r.st = 5; break;
+        case 5: r.len |= (uint16_t)b << 8; r.idx = 0; r.st = 6; break;
+        case 6:
+            if (r.idx < sizeof(r.buf)) r.buf[r.idx++] = b;
+            if (r.idx >= r.len || r.idx >= sizeof(r.buf)) {
+                if (r.buf[0] != 0 && r.idx >= 3) {          // a target is present
+                    r.distance = r.buf[1] | ((uint16_t)r.buf[2] << 8);  // cm
+                }
+                r.st = 0;
+            }
+            break;
     }
 }
+
+void readRadarDistance() {
+    while (Serial1.available()) feedRadar(0, (uint8_t)Serial1.read());
+    while (Serial2.available()) feedRadar(1, (uint8_t)Serial2.read());
+    distanceBottom = radarBottom.distance;
+    distanceTop    = radarTop.distance;
+}
+#endif
 
 // ── Night check (after sunset OR before sunrise) ──
 // Compares local times-of-day rather than absolute epochs. Absolute-epoch
@@ -649,49 +578,6 @@ bool isNightNow() {
     int sunriseMin = minutesOfDay(sunriseEpoch, localUtcOffsetSec);
     int sunsetMin  = minutesOfDay(sunsetEpoch,  localUtcOffsetSec);
     return (nowMin >= sunsetMin) || (nowMin < sunriseMin);
-}
-
-// ── Arm / disarm presence interrupts ──
-// Interrupts are armed only when it is night AND the lights are OFF AND the unit
-// is in AUTO mode. While the lights are ON (or during the day) the interrupts are
-// detached, so continued presence on the stairs can't reset the countdown — the
-// lights time out after the configured duration and the interrupt is re-armed.
-void armInterrupts() {
-    if (interruptsArmed) return;
-    irqBottomTriggered = false;
-    irqTopTriggered    = false;
-
-    if (tofBottomReady) {
-        tofBottom.writeReg(VL53L0X::SYSTEM_INTERRUPT_CLEAR, 0x01);  // clear stale latch
-        attachInterrupt(digitalPinToInterrupt(VL53L0X_IRQ_BOTTOM), onTofBottomIrq, FALLING);
-        if (digitalRead(VL53L0X_IRQ_BOTTOM) == LOW) irqBottomTriggered = true;  // already present
-    }
-    if (tofTopReady) {
-        tofTop.writeReg(VL53L0X::SYSTEM_INTERRUPT_CLEAR, 0x01);
-        attachInterrupt(digitalPinToInterrupt(VL53L0X_IRQ_TOP), onTofTopIrq, FALLING);
-        if (digitalRead(VL53L0X_IRQ_TOP) == LOW) irqTopTriggered = true;
-    }
-    interruptsArmed = true;
-    Serial.println("[🔔] Presence interrupts armed");
-}
-
-void disarmInterrupts() {
-    if (!interruptsArmed) return;
-    if (tofBottomReady) detachInterrupt(digitalPinToInterrupt(VL53L0X_IRQ_BOTTOM));
-    if (tofTopReady)    detachInterrupt(digitalPinToInterrupt(VL53L0X_IRQ_TOP));
-    irqBottomTriggered = false;
-    irqTopTriggered    = false;
-    interruptsArmed = false;
-    Serial.println("[🔕] Presence interrupts disarmed");
-}
-
-void updateInterrupts() {
-    bool shouldArm = isNightNow() && !lightsOn && (overrideMode == 0);
-    if (shouldArm && !interruptsArmed) {
-        armInterrupts();
-    } else if (!shouldArm && interruptsArmed) {
-        disarmInterrupts();
-    }
 }
 
 // ═════════════════════════════════════════════════
@@ -975,7 +861,7 @@ async function fetchData() {
     // Distance — bottom
     const sTileB = document.getElementById('sensorTileB');
     const sMetricB = document.getElementById('distB');
-    const distB_cm = d.distance_bottom_mm ? (d.distance_bottom_mm / 10).toFixed(0) : '--';
+    const distB_cm = d.distance_bottom_mm ? d.distance_bottom_mm : '--';
     if (d.presence_bottom) {
       sTileB.className = 'tile motion active';
       sMetricB.innerHTML = distB_cm + ' <small style="font-size:.65rem;opacity:.6">cm · PRESENT</small>';
@@ -990,7 +876,7 @@ async function fetchData() {
     // Distance — top
     const sTileT = document.getElementById('sensorTileT');
     const sMetricT = document.getElementById('distT');
-    const distT_cm = d.distance_top_mm ? (d.distance_top_mm / 10).toFixed(0) : '--';
+    const distT_cm = d.distance_top_mm ? d.distance_top_mm : '--';
     if (d.presence_top) {
       sTileT.className = 'tile motion active';
       sMetricT.innerHTML = distT_cm + ' <small style="font-size:.65rem;opacity:.6">cm · PRESENT</small>';
@@ -1300,12 +1186,13 @@ void handleDistance() {
             return;
         }
 
+        // NOTE: with mmWave radar there is no code-configurable presence
+        // threshold — the radar's sensitivity is set via its own HLK app. This
+        // value is kept for API compatibility only (no longer affects sensing).
         if (isBottom) {
             configuredDistanceBottomMm = (unsigned long)newDist;
-            if (tofBottomReady) applyToFThreshold(tofBottom, configuredDistanceBottomMm);
         } else {
             configuredDistanceTopMm = (unsigned long)newDist;
-            if (tofTopReady) applyToFThreshold(tofTop, configuredDistanceTopMm);
         }
 
         Serial.printf("[⚙] Distance %s set to %lumm (HTTP)\n",
