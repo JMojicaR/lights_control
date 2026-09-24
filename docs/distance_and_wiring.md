@@ -106,3 +106,39 @@ old I²C bus (open-drain, 400 pF budget), so the 3 m ceiling is gone.
 - **Gate pulldown** (10 kΩ) keeps the MOSFET OFF while the ESP32 boots.
 - **Fuse the 12 V feed (3 A)** and star-ground everything at one point.
 - Radars run on **5 V** (not 3.3 V) — do not feed them from the ESP32's 3V3 pin.
+- **LD2410C is a drop-in** for the LD2410B (same OUT + UART + 256 kbps protocol),
+  with breadboard-friendly 2.54 mm pins and built-in BLE for app configuration.
+  **Verify the pin order** on the silkscreen — it can differ between B and C.
+
+---
+
+## 3. Cable choice — Cat6 vs separate 24 AWG
+
+**Use Cat6 (or Cat5e).** It is the better choice for this configuration:
+
+| Factor | Cat6 | Separate 24 AWG |
+|--------|------|-----------------|
+| Noise immunity | ✅ twisted pairs (each signal + GND) | ❌ untwisted unless done by hand |
+| Conductors | ✅ 8 wires (4 pairs) | must buy 4+ strands |
+| Gauge / power | ✅ 23 AWG solid (less 5 V drop) | 24 AWG (higher resistance) |
+| Cost / convenience | ✅ one cable | multiple rolls |
+
+The OUT and TX lines are 3.3 V push-pull digital — reliable over 15–30 m only if
+each is **twisted with a GND return** to reject EMI. Cat6 provides that for free.
+
+### Per-radar Cat6 pair assignment
+
+| Pair | Signals | Purpose |
+|------|---------|---------|
+| 1 (orange) | VCC (5 V) + GND | power |
+| 2 (green) | OUT + GND | presence |
+| 3 (blue) | TX + GND | UART distance |
+| 4 (brown) | RX + GND | spare (future config) |
+
+- One Cat6 cable **per radar** (bottom and top run back to the controller).
+- 23 AWG solid handles the radar's ~80–100 mA with negligible drop over 20 m.
+
+### When to use separate 24 AWG instead
+
+- Short runs (< ~2 m) or bench prototyping, where flexibility beats noise.
+- Where you need **stranded** wire for tight, repeated flexing.
