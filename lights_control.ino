@@ -1,10 +1,10 @@
 /**
- * Staircase Light Controller — ESP32-S3 SuperMini (mmWave radar + LDR option)
+ * Staircase Light Controller — ESP32-S3 SuperMini (mmWave radar + BH1750 option)
  * ===========================================================================
  *
  * Automatically controls a 12V LED strip on a 5m staircase based on:
  *   1. Presence detection (HLK-LD2410B mmWave radar — moving OR stationary)
- *   2. Ambient light level (LDR photoresistor)
+ *   2. Ambient light level (BH1750 I²C sensor)
  *   3. Time of day vs sunset (HTTP APIs)
  *
  * Lights turn ON when: person detected on stairs AND it's dark AND past sunset.
@@ -24,7 +24,7 @@
  *   - ESP32-S3 SuperMini
  *   - HLK-LD2410B mmWave radar — bottom (OUT GPIO 4, UART RX GPIO 7)
  *   - HLK-LD2410B mmWave radar — top    (OUT GPIO 6, UART RX GPIO 8)
- *   - LDR photoresistor divider (ADC GPIO 1)
+ *   - BH1750 ambient light sensor (I²C: SDA 12, SCL 13)
  *   - IRLZ44N MOSFET switching 12V LED strip (GPIO 5)
  *   - 12V DC power supply (≥6A for 5m strip)
  */
@@ -32,6 +32,8 @@
 #include "config.h"
 #include <WiFi.h>
 #include <HTTPClient.h>
+#include <Wire.h>
+#include <BH1750.h>
 #include <ArduinoJson.h>
 #include <WebServer.h>
 #include <time.h>
@@ -42,6 +44,7 @@
 #define USE_RADAR_UART  1
 
 // ── Objects ─────────────────────────────────────
+BH1750 lightMeter;      // ambient light sensor (I²C, <30 cm)
 WebServer server(80);
 Preferences prefs;
 
@@ -147,14 +150,19 @@ void setup() {
     pinMode(STATUS_LED_PIN, OUTPUT);
     digitalWrite(STATUS_LED_PIN, LOW);
 
-    // ── Presence radars (HLK-LD2410B) + LDR ambient light ──
+    // ── Presence radars (HLK-LD2410B) + BH1750 ambient light ──
     // Each radar's OUT pin is HIGH when a person is present (moving or
-    // stationary). The LDR divider is read on the ADC. No I²C bus, no address
-    // collision, no pull-up tuning — the whole point of this option.
+    // stationary). The BH1750 sits <30 cm away on a short I²C link.
     pinMode(RADAR_BOTTOM_PIN, INPUT_PULLDOWN);
     pinMode(RADAR_TOP_PIN, INPUT_PULLDOWN);
-    analogReadResolution(12);
-    pinMode(LDR_PIN, INPUT);
+
+    // BH1750 ambient light sensor (short I²C, <30 cm — within spec)
+    Wire.begin(I2C_SDA, I2C_SCL);
+    if (!lightMeter.begin(LIGHT_SENSOR_MODE, 0x23, &Wire)) {
+        Serial.println("[✗] BH1750 not found — check wiring");
+    } else {
+        Serial.println("[✓] BH1750 ready");
+    }
 
 #if USE_RADAR_UART
     // Radar UART (distance in cm for the dashboard) — receive-only.
@@ -212,7 +220,7 @@ void loop() {
     // ── Presence (mmWave radar OUT pins) + presence timeout ──
     processPresence();
 
-    // ── Ambient light (LDR) polling (configurable interval, default 5s) ──
+    // ── Ambient light (BH1750) polling (configurable interval, default 5s) ──
     static unsigned long lastLuxPoll = 0;
     unsigned long luxPollMs = configuredPollIntervalSec * 1000UL;
     if (lastLuxPoll == 0 || now - lastLuxPoll >= luxPollMs) {
@@ -461,7 +469,7 @@ void syncSunset() {
 }
 
 // ═════════════════════════════════════════════════
-// Sensors — mmWave radar presence (HLK-LD2410B) + LDR
+// Sensors — mmWave radar presence (HLK-LD2410B) + BH1750
 // ═════════════════════════════════════════════════
 
 // ── Should a presence report be accepted right now? ──
@@ -509,14 +517,13 @@ void processPresence() {
     }
 }
 
-// ── Ambient light (LDR photoresistor) ──
-// Reads the LDR divider and maps it to a rough 0..LDR_MAX_LUX scale. Exact lux
-// is not needed — only "is it dark enough?" — so a linear mapping plus a
-// calibrated LUX_THRESHOLD (see config.h) is sufficient.
+// ── Ambient light (BH1750, I²C) ──
+// Reads the real lux value directly from the BH1750 (no calibration needed).
 void readLux() {
-    int adc = analogRead(LDR_PIN);             // 0..4095 (12-bit)
-    lux = (float)adc / 4095.0f * LDR_MAX_LUX;
-    if (lux < 0) lux = 0;
+    if (lightMeter.measurementReady()) {
+        lux = lightMeter.readLightLevel();
+        if (lux < 0) lux = 0;
+    }
 }
 
 #if USE_RADAR_UART
