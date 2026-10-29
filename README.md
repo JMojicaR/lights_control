@@ -1,6 +1,14 @@
-# Staircase Light Controller — ESP32-S3
+# Staircase Light Controller — ESP32-S3 (mmWave radar + BH1750)
 
-Automatically controls a 12V LED strip on a 5m staircase using **VL53L0X ToF presence detection**, ambient light, and time-of-day logic. Includes a **web dashboard** for live monitoring and manual override.
+Automatically controls a 12V LED strip on a 5m staircase using **HLK-LD2410B/C
+mmWave radar** for presence detection, a **BH1750** ambient-light sensor, and
+time-of-day logic (sunset API). Includes a **web dashboard** for live monitoring
+and manual override.
+
+> This is the **`uart_option`** variant. The radars detect a person who is
+> **completely still** (micro-motion) — the key advantage over PIR — and they
+> connect over simple digital lines instead of the old I²C ToF bus, so they can
+> sit **tens of metres** from the controller over cheap **Cat6** cable.
 
 ## How It Works
 
@@ -13,123 +21,179 @@ Any condition false ────────────────▶ LIGHTS O
 ```
 
 **Decision logic:**
-1. **VL53L0X ToF** (bottom of stairs) measures distance via laser — detects presence within a configurable range (3–15cm, default 7cm)
-2. **VL53L0X ToF** (top of stairs) — same, for the upper landing (independent threshold)
-3. **BH1750** measures ambient light (lux) — ensures lights don't fire during daytime
-4. **sunrise-sunset.org API** provides sunset time for your location — lights only at night
-5. Lights stay ON for a configurable duration (default 90s) after turning on, then turn OFF — the presence interrupt is disarmed while the lights are on, so continued presence on the stairs can't reset the countdown
-6. **Manual override** via web dashboard — force ON / OFF / AUTO
+1. **mmWave radar OUT pin** (bottom + top of stairs) — HIGH when a person is
+   present, moving **or stationary**. No I²C bus, no address collision, no
+   pull-up tuning.
+2. **BH1750** measures ambient light (lux) — ensures lights don't fire in daylight.
+3. **sunrise-sunset.org API** provides sunset time — lights only at night.
+4. Lights stay ON for a configurable duration (default 90 s), then fade OFF.
+   A motion debounce (default 2 s) ignores re-triggers while the lights are on.
+5. **Manual override** via web dashboard — force ON / OFF / AUTO.
 
-Presence is detected by **hardware interrupt, not polling**. Each VL53L0X's
-GPIO1 pin is configured as an active-low threshold interrupt that fires the
-moment the measured distance drops below the per-sensor threshold. The ESP32
-attaches an interrupt handler that registers presence and turns the lights on.
-
-The interrupt is **armed only after sunset and while the lights are OFF** — it is
-disarmed while the lights are on (so the countdown runs to completion) and
-re-armed when they go off. Ghost/crosstalk readings below 3cm are still filtered
-out, and the presence threshold is configurable **3cm to 15cm** (default 7cm).
-The ambient-light BH1750 sensor is still polled (**5s by default**, configurable),
+Presence is read by polling each radar's OUT pin (debounced), and the radars'
+UART reports **live distance in mm** to the dashboard (best-effort, independent
+of the presence logic). The BH1750 is polled (**5 s by default**, configurable),
 since lux changes slowly.
 
-### Why VL53L0X instead of PIR?
+### Why mmWave radar instead of PIR?
 
-| Feature | HC-SR501 PIR | VL53L0X ToF |
-|---------|-------------|-------------|
-| Detection method | Passive infrared (heat movement) | Laser time-of-flight (distance) |
+| Feature | HC-SR501 PIR | HLK-LD2410B/C mmWave |
+|---------|-------------|----------------------|
+| Detection method | Passive infrared (heat movement) | 24 GHz radar (micro-motion) |
 | Still person | ❌ Not detected | ✅ Detected |
 | Hot environments | ❌ Fails (ambient ≈ body temp) | ✅ Works |
-| Output | Binary (HIGH/LOW) | Distance in mm |
-| Range | ~5m cone | Up to 2m (reliable ~1.2m) |
-| Interface | Single digital pin | I²C (shared bus) + GPIO1 interrupt output |
-| Multi-sensor | 1 pin each | XSHUT pin + unique I²C address |
+| Output | Binary (HIGH/LOW) | Binary OUT **+** UART distance |
+| Range | ~5 m cone | Up to ~6 m, configurable |
+| Interface | Single digital pin | OUT pin + UART (256 kbps) |
+| Configurability | Fixed | Sensitivity/gates via HLK app or UART |
+
+It also replaces the earlier **VL53L0X ToF** approach: the ToF needed a shared
+I²C bus (address re-mapping + ~3 m cable ceiling), while the radar's push-pull
+digital lines run 15–30 m with no extra hardware.
+
+## Sensors & Specifications
+
+### HLK-LD2410B / LD2410C — 24 GHz mmWave presence radar (×2)
+
+| Parameter | Value |
+|-----------|-------|
+| Frequency | 24 GHz mmWave |
+| Presence | **OUT** pin HIGH = person present (moving **or** stationary) |
+| Supply | **5 V DC** (not 3.3 V) |
+| Current | ~80–100 mA typical |
+| Logic level | 3.3 V push-pull (OUT) |
+| UART | 256 000 baud, 8N1 (distance + configuration) |
+| Detection range | up to ~6 m, configurable (HLK app / UART) |
+| OUT interface | Single digital pin |
+
+**LD2410C vs LD2410B:** the **LD2410C** is a drop-in replacement — same OUT pin,
+same UART protocol (256 kbps), same 5 V power — but adds **built-in BLE** for
+configuration from the phone app and breadboard-friendly 2.54 mm pins.
+**Verify the pin order** on the silkscreen, it can differ between B and C.
+
+### BH1750 — ambient light sensor
+
+| Parameter | Value |
+|-----------|-------|
+| Interface | I²C, address **0x23** |
+| Output | Real lux (no calibration) |
+| Mode | CONTINUOUS_HIGH_RES_MODE |
+| Placement | **< 30 cm** from the ESP32 (short I²C — no pull-up/length tuning) |
+| Wiring | SDA **GPIO 12**, SCL **GPIO 13** |
 
 ## Web Dashboard
 
 Open `http://<esp32-ip>/` in any browser on the same network.
 
 | Tile | Description |
-|---------|-------------|
-| **Live status** | Lights ON/OFF, ambient lux, distance (cm) bottom/top, local time, sunset |
+|------|-------------|
+| **Live status** | Lights ON/OFF, ambient lux, radar distance (mm) bottom/top, presence, local time, sunset |
 | **Manual override** | Force ON, Force OFF, or return to AUTO mode |
 | **Uptime & RSSI** | Device uptime and WiFi signal strength |
-| **Duration / Distance / Poll** | Set light duration (s), per-sensor presence distance (mm), and ambient-light (BH1750) polling interval (s), persisted to NVS |
+| **Duration / Poll** | Set light duration (s) and ambient-light (BH1750) polling interval (s), persisted to NVS |
 | **JSON API** | `GET /api` returns machine-readable JSON |
-| **Override API** | `GET /api/override?mode=on\|off\|auto` for programmatic control |
-| **Distance API** | `POST /api/distance?position=bottom\|top&mm=N` to set a presence threshold |
-| **Poll API** | `POST /api/poll?seconds=N` to set the ambient-light polling interval |
+| **Override API** | `GET /api/override?mode=on\|off\|auto` |
+| **Duration API** | `POST /api/duration?seconds=N` |
+| **Poll API** | `POST /api/poll?seconds=N` |
 | **Auto-refresh** | Dashboard polls every 2 seconds |
+
+> `/api/distance` remains for backwards compatibility — it validates the request
+> but **no longer affects sensing** (radar sensitivity is set via the HLK app).
 
 ### API Examples
 
 ```bash
-# Get current status
 curl http://192.168.1.42/api
 # → {"lights_on":false,"duty":0,"lux":3.5,"presence_bottom":true,"presence_top":false,
 #    "distance_bottom_mm":450,"distance_top_mm":2100,"time":"14:30","sunset":"19:15",...}
 
-# Force lights on (e.g., from a script or home automation)
-curl "http://192.168.1.42/api/override?mode=on"
-# → {"override":"on","lights_on":true}
+curl "http://192.168.1.42/api/override?mode=on"    # → {"override":"on","lights_on":true}
+curl "http://192.168.1.42/api/override?mode=auto"  # → {"override":"auto","lights_on":false}
 
-# Return to automatic mode
-curl "http://192.168.1.42/api/override?mode=auto"
-# → {"override":"auto","lights_on":false}
-
-# Set light duration (seconds)
-curl -X POST "http://192.168.1.42/api/duration?seconds=120"
-# → {"duration_sec":120,"active_duration_sec":120,"persisted":true,"ok":true}
-
-# Set presence distance thresholds (mm, 30–150)
-curl -X POST "http://192.168.1.42/api/distance?position=bottom&mm=60"
-# → {"position":"bottom","distance_mm":60,"ok":true}
-curl -X POST "http://192.168.1.42/api/distance?position=top&mm=50"
-# → {"position":"top","distance_mm":50,"ok":true}
-
-# Set sensor polling interval (seconds, 1–300)
-curl -X POST "http://192.168.1.42/api/poll?seconds=10"
-# → {"poll_interval_sec":10,"ok":true}
+curl -X POST "http://192.168.1.42/api/duration?seconds=120"  # set light duration
+curl -X POST "http://192.168.1.42/api/poll?seconds=10"        # set BH1750 poll interval
 ```
 
 ## Hardware
 
-| Component | Purpose | GPIO / I²C |
+| Component | Purpose | Pins |
 |-----------|---------|------|
 | ESP32-S3 SuperMini | Controller | — |
-| VL53L0X ToF (bottom) | Presence detection (bottom of stairs) | I²C addr 0x29, XSHUT GPIO 4, IRQ GPIO 7 |
-| VL53L0X ToF (top) | Presence detection (top of stairs) | I²C addr 0x30, XSHUT GPIO 6, IRQ GPIO 8 |
-| BH1750 | Ambient light sensor | I²C 0x23 (SDA 12, SCL 13) |
-| IRLZ44N MOSFET | Switch 12V LED strip | 5 (PWM-capable) |
-| 12V LED strip (5m) | Staircase lighting | MOSFET drain |
-| 12V DC PSU (≥6A) | Power for LED strip | — |
+| HLK-LD2410B/C radar (bottom) | Presence detection | OUT → GPIO 4, TX → GPIO 7 (RX) |
+| HLK-LD2410B/C radar (top) | Presence detection | OUT → GPIO 6, TX → GPIO 8 (RX) |
+| BH1750 | Ambient light sensor | I²C SDA 12, SCL 13 |
+| IRLZ44N MOSFET | Switch 12 V LED strip | Gate → GPIO 5 |
+| 12 V LED strip (5 m) | Staircase lighting | MOSFET drain |
+| 12 V DC PSU (≥6 A) | Power for LED strip + buck | — |
 
-### Wiring
+### Wiring (pin-by-pin)
 
 ```
-ESP32-S3              Peripheral
-────────              ──────────
-GPIO 4   ──────────── VL53L0X #1 XSHUT (bottom)
-GPIO 6   ──────────── VL53L0X #2 XSHUT (top)
-GPIO 7   ──────────── VL53L0X #1 GPIO1 (bottom, interrupt out)
-GPIO 8   ──────────── VL53L0X #2 GPIO1 (top, interrupt out)
-GPIO 12  ──────────── VL53L0X #1 SDA, VL53L0X #2 SDA, BH1750 SDA
-GPIO 13  ──────────── VL53L0X #1 SCL, VL53L0X #2 SCL, BH1750 SCL
-3.3V    ──────────── VL53L0X VIN (×2), BH1750 VCC
-GND     ──────────── VL53L0X GND (×2), BH1750 GND
+ESP32-S3               Peripheral
+────────               ──────────
+GPIO 4   ───────────── Radar BOTTOM OUT   (presence, HIGH = present)
+GPIO 7   ───────────── Radar BOTTOM TX    (UART distance, 256000 baud)
+GPIO 6   ───────────── Radar TOP OUT
+GPIO 8   ───────────── Radar TOP TX
+GPIO 12  ───────────── BH1750 SDA
+GPIO 13  ───────────── BH1750 SCL
+GPIO 5   ──[10 kΩ]──┬─ IRLZ44N GATE   (10 kΩ pulldown to GND keeps it OFF at boot)
+                    └─ GND
+5 V      ───────────── Radar VCC (×2)   ← NOT the ESP32 3V3 pin
+3.3 V    ───────────── BH1750 VCC
+GND      ───────────── Radar GND (×2), BH1750 GND
 
-VL53L0X XSHUT pins must have 10KΩ pull-up to 3.3V (many modules include this).
-GPIO1 is the sensor's active-low interrupt output — wire it to the ESP32 IRQ pin
-listed above (a 10KΩ pull-up to 3.3V is harmless, and required if your module's
-GPIO1 is open-drain).
-All three I²C devices share the same SDA/SCL bus — unique addresses assigned at boot.
-
-MOSFET circuit:
-GPIO 5 ──[10KΩ]──┬── IRLZ44N GATE
-                 └── GND
-
-12V PSU (+) ─── LED strip (+) ─── LED strip (-) ─── IRLZ44N DRAIN
-12V PSU (-) ─── IRLZ44N SOURCE ─── GND (common)
+12 V PSU (+) ─── LED strip (+) ─── LED strip (−) ─── IRLZ44N DRAIN
+12 V PSU (−) ─── IRLZ44N SOURCE ─── GND (common)
 ```
+
+## Electrical & Wiring Considerations (Cat6 / Ethernet cable)
+
+The radar `OUT` and `UART` lines are **3.3 V push-pull digital** — no I²C
+open-drain/400 pF ceiling — so they run far longer than the old ToF bus.
+
+### Distance limits
+
+| Signal | Type | Comfortable | Max (with care) |
+|--------|------|-------------|-----------------|
+| Radar **OUT** (presence) | digital, slow | **20–30 m** | 50 m+ |
+| Radar **UART** (256 kbps) | digital, push-pull | **15–20 m** | 30 m+ (lower baud) |
+
+> **Staircase reality check:** top/bottom radars are at most ~5 m from a central
+> ESP32 — well inside the comfort zone.
+
+### Use Cat6 (or Cat5e) — one cable per radar
+
+Cat6 gives you twisted pairs for free (each signal twisted with a GND return),
+which is exactly what rejects EMI on a 15–30 m digital run.
+
+| Factor | Cat6 | Separate 24 AWG |
+|--------|------|-----------------|
+| Noise immunity | ✅ 4 twisted pairs | ❌ must twist by hand |
+| Conductors | ✅ 8 wires | buy 4+ strands |
+| Gauge / power | ✅ 23 AWG solid (low 5 V drop) | 24 AWG (higher resistance) |
+| Cost / convenience | ✅ one cable | multiple rolls |
+
+### Per-radar Cat6 pair assignment
+
+| Pair | Colour | Signals | Purpose |
+|------|--------|---------|---------|
+| 1 | orange | VCC (5 V) + GND | power |
+| 2 | green | OUT + GND | presence |
+| 3 | blue | TX + GND | UART distance |
+| 4 | brown | RX + GND | spare (future config) |
+
+### Power & electrical notes
+
+- Radars run on **5 V** (not 3.3 V) — never feed them from the ESP32's 3V3 pin.
+- At 20 m of 23 AWG the 5 V drop at ~80–100 mA is negligible (~0.15 V). For
+  > 30 m, run 12 V and regulate to 5 V **at each radar**.
+- UART at 256 kbps is trivial over 30 m; drop to 115200/9600 for noisy long runs.
+- Fuse the **12 V feed (3 A)** and star-ground everything at one point.
+- The MOSFET gate needs a **10 kΩ pulldown to GND** so the strip stays off while
+  the ESP32 boots.
+- **LD2410C is drop-in** for LD2410B (same OUT + UART + protocol); check the pin
+  order on the silkscreen — it can differ between B and C.
 
 ## APIs Used
 
@@ -137,8 +201,6 @@ GPIO 5 ──[10KΩ]──┬── IRLZ44N GATE
 |-----|----------|---------|---------------|
 | timeapi.io | `timeapi.io/api/v1/time/current/zone?timezone={tz}` | Current time + timezone | No |
 | sunrise-sunset.org | `api.sunrise-sunset.org/json` | Sunset/sunrise times | No |
-
-Both are free, no API key needed.
 
 ## Configuration
 
@@ -150,35 +212,35 @@ Edit `config.h` before flashing:
 #define LATITUDE        19.4326    // Your location
 #define LONGITUDE       -99.1332
 #define TIMEZONE        "America/Mexico_City"
-#define LUX_THRESHOLD   30         // Lux below this = "dark"
-#define VL53L0X_MIN_PRESENCE_MM 30   // 3cm — minimum sensing range (ghost-reading floor)
-#define DISTANCE_DEFAULT_MM  70      // 7cm — default presence distance (configurable via dashboard)
-#define DEFAULT_LIGHT_DURATION_SEC  90  // Seconds to keep lights on after detection
-#define VL53L0X_IRQ_BOTTOM  7        // Bottom sensor GPIO1 (interrupt out) → ESP32 GPIO 7
-#define VL53L0X_IRQ_TOP     8        // Top sensor GPIO1 (interrupt out)    → ESP32 GPIO 8
-#define POLL_INTERVAL_DEFAULT_SEC 5  // Ambient-light (BH1750) polling interval (configurable via dashboard)
+
+#define RADAR_BOTTOM_PIN   4     // bottom radar OUT → GPIO 4
+#define RADAR_TOP_PIN      6     // top radar OUT    → GPIO 6
+#define LED_MOSFET_PIN     5     // IRLZ44N gate
+#define I2C_SDA            12    // BH1750 SDA
+#define I2C_SCL            13    // BH1750 SCL
+
+#define RADAR_UART_BAUD    256000
+#define RADAR_BOTTOM_RX    7     // ESP32 RX ← bottom radar TX
+#define RADAR_TOP_RX       8     // ESP32 RX ← top radar TX
+
+#define LUX_THRESHOLD      30    // lux below this = "dark enough"
+#define DEFAULT_LIGHT_DURATION_SEC  90
+#define MOTION_DEBOUNCE_MS  2000  // ignore re-triggers within this window
+#define POLL_INTERVAL_DEFAULT_SEC  5
 ```
 
-The presence distance (bottom and top, independently), light duration, and
-ambient-light polling interval can all be changed live from the dashboard — values
-are persisted to NVS and survive reboot. Allowed presence distance range: **30–150 mm**
-(3–15cm). Lux polling interval range: **1–300 s** (default 5s).
+Light duration and the BH1750 polling interval can be changed live from the
+dashboard (persisted to NVS, survive reboot). Radar sensitivity/detection gates
+are configured via the **HLK app** (or UART), not the ESP32.
 
 ## Build & Flash
 
 ```bash
-# Install dependencies (first time only)
 arduino-cli lib install BH1750
 arduino-cli lib install ArduinoJson
-arduino-cli lib install VL53L0X
 
-# Compile
 arduino-cli compile --fqbn esp32:esp32:esp32s3 .
-
-# Flash
 arduino-cli upload -p /dev/ttyUSB0 --fqbn esp32:esp32:esp32s3 .
-
-# Monitor
 arduino-cli monitor -p /dev/ttyUSB0 -c baudrate=115200
 ```
 
@@ -186,43 +248,44 @@ arduino-cli monitor -p /dev/ttyUSB0 -c baudrate=115200
 
 ```
 === Staircase Light Controller ===
-[✓] VL53L0X bottom ready (addr 0x29)
-[✓] VL53L0X top ready (addr 0x30)
-[🔔] Bottom sensor → interrupt on GPIO 7 (threshold 70mm)
-[🔔] Top sensor → interrupt on GPIO 8 (threshold 70mm)
+[✓] Radar bottom OUT on GPIO 4
+[✓] Radar top OUT on GPIO 6
 [✓] BH1750 ready
 [✓] WiFi connected — IP: 192.168.1.42
-[⏰] Time synced: 2026-07-10T16:19:26-06:00 (UTC-6, DST=no)
-[🌅] Sunset: 2026-06-27T01:15:00 UTC  |  Sunrise: 2026-06-26T12:00:00 UTC
 [🌐] Dashboard: http://192.168.1.42/
 --- Ready ---
-[STATUS] 14:30:15 | Lux: 450 | Bottom: clear (2100mm) | Top: clear (2050mm) | Lights: OFF | Sunset: 19:15 | Mode: AUTO
-[🔔] Presence interrupts armed
+[STATUS] 14:30:15 | Lux: 450 | Bottom: 2100mm | Top: 2050mm | Lights: OFF | Sunset: 19:15 | Mode: AUTO
 [👣] Presence detected — bottom! (450 mm)
 [💡] Decision: ON  (presence=1 dark=1 night=1 lux=3)
 [💡] Lights → ON (fading in)
-[🔕] Presence interrupts disarmed
 ```
 
 ## Dependencies (Arduino Libraries)
 
 | Library | Version | Install |
 |---------|---------|---------|
-| VL53L0X | ≥1.3.0 | `arduino-cli lib install VL53L0X` |
 | BH1750 | ≥1.3.0 | `arduino-cli lib install BH1750` |
 | ArduinoJson | ≥7.0 | `arduino-cli lib install ArduinoJson` |
 
-WiFi, HTTPClient, Wire, and **WebServer** are included with the ESP32 board package.
+WiFi, HTTPClient, Wire, and WebServer are included with the ESP32 board package.
+(No VL53L0X library — that sensor was replaced by the mmWave radars.)
 
 ## Enclosure Models
 
-FreeCAD (.FCStd) and STL models for 3D printing are in `enclosures/`:
+FreeCAD (.FCStd) models are in `enclosures/`:
 
 | File | Description |
 |------|-------------|
-| `enclosures/main_box.fcstd` | Main controller enclosure (ESP32-S3 + MOSFET + terminals) |
-| `enclosures/sensor_bottom.fcstd` | VL53L0X housing — bottom of stairs |
-| `enclosures/sensor_top.fcstd` | VL53L0X housing — top of stairs |
-| `enclosures/bh1750_housing.fcstd` | BH1750 ambient light sensor housing |
+| `enclosures/main_box.FCStd` | Main controller enclosure (ESP32-S3 + MOSFET + terminals) |
+| `enclosures/sensor_bottom.FCStd` | Radar housing — bottom of stairs |
+| `enclosures/sensor_top.FCStd` | Radar housing — top of stairs |
+| `enclosures/bh1750_housing.FCStd` | BH1750 ambient-light sensor housing |
 
 Print in PETG or ABS for heat resistance (PLA may warp near the MOSFET).
+
+## Other docs (this branch)
+
+- `docs/distance_and_wiring.md` — distance limits + exact connection diagram + Cat6 pair assignment
+- `docs/BOM_UART.md` — bill of materials
+- `docs/UART_schematic.svg` — schematic
+- `docs/cost_roi_UART.md` + `docs/market_analysis_UART.md` / `.pdf` — cost, ROI & market analysis (DIY kit)
