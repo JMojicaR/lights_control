@@ -1,0 +1,8 @@
+(footprint "LED_5mm" (version 20240108) (generator "hermes")
+  (layer "F.Cu")
+  (attr through_hole)
+  (fp_text reference "REF**" (at 0 -3.5 0) (layer "F.Silkscreen") (effects (font (size 1 1) (thickness 0.15))))
+  (fp_text value "VAL**" (at 0 3.5 0) (layer "F.Fab") (effects (font (size 1 1) (thickness 0.15))))
+  (pad "1" thru_hole circle (at 0.0 -1.27) (size 1.7 1.7) (drill 1.0) (layers "*.Cu" "*.Mask") (remove_unused_layers) (uuid "a484c872-19df-49a2-90ce-42f93a128dff"))
+  (pad "2" thru_hole circle (at 0.0 1.27) (size 1.7 1.7) (drill 1.0) (layers "*.Cu" "*.Mask") (remove_unused_layers) (uuid "9681effc-136e-4a8f-a475-1906aff6f646"))
+)

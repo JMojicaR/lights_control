@@ -1,0 +1,7 @@
+(sym_lib_table
+  (version 7)
+  (lib (name "lights_control") (type "KiCad") (uri "/home/hermesbot/lights_control/hardware/lights_control.kicad_sym") (options "") (descr "custom symbols"))
+  (lib (name "Device") (type "KiCad") (uri "/home/hermesbot/tools/kicad-symbols/Device.kicad_symdir") (options "") (descr ""))
+  (lib (name "Connector") (type "KiCad") (uri "/home/hermesbot/tools/kicad-symbols/Connector.kicad_symdir") (options "") (descr ""))
+  (lib (name "power") (type "KiCad") (uri "/home/hermesbot/tools/kicad-symbols/power.kicad_symdir") (options "") (descr ""))
+)

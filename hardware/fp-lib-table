@@ -1,0 +1,4 @@
+(fp_lib_table
+  (version 7)
+  (lib (name "lights_control") (type "KiCad") (uri "/home/hermesbot/lights_control/hardware/lights_control.pretty") (options "") (descr "custom footprints"))
+)

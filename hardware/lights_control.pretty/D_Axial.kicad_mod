@@ -1,0 +1,8 @@
+(footprint "D_Axial" (version 20240108) (generator "hermes")
+  (layer "F.Cu")
+  (attr through_hole)
+  (fp_text reference "REF**" (at 0 -3.5 0) (layer "F.Silkscreen") (effects (font (size 1 1) (thickness 0.15))))
+  (fp_text value "VAL**" (at 0 3.5 0) (layer "F.Fab") (effects (font (size 1 1) (thickness 0.15))))
+  (pad "1" thru_hole circle (at -5.08 0.0) (size 1.7 1.7) (drill 1.0) (layers "*.Cu" "*.Mask") (remove_unused_layers) (uuid "b9407272-b1d0-49c4-91b3-62c1f681edf5"))
+  (pad "2" thru_hole circle (at 5.08 0.0) (size 1.7 1.7) (drill 1.0) (layers "*.Cu" "*.Mask") (remove_unused_layers) (uuid "d28bc1c1-5d48-439a-a5a5-b51872f892c4"))
+)
