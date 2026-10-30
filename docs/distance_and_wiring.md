@@ -52,12 +52,12 @@ old I²C bus (open-drain, 400 pF budget), so the 3 m ceiling is gone.
 | | GND | GND rail | — | black |
 | | **OUT** | ESP32-S3 | **GPIO 4** | yellow |
 | | **TX** | ESP32-S3 | **GPIO 7** (RX) | green |
-| | RX | — (unused) | — | — |
+| | **RX** | ESP32-S3 | **GPIO 9** (TX) | white |
 | **Radar TOP** | VCC (5 V) | 5 V rail | — | red |
 | | GND | GND rail | — | black |
 | | **OUT** | ESP32-S3 | **GPIO 6** | yellow |
 | | **TX** | ESP32-S3 | **GPIO 8** (RX) | green |
-| | RX | — (unused) | — | — |
+| | **RX** | ESP32-S3 | **GPIO 10** (TX) | white |
 | **LDR divider** | 3V3 → LDR → tap → 10 kΩ → GND | ESP32-S3 | **GPIO 1** (ADC) | tap wire |
 | **MOSFET** | ESP32-S3 **GPIO 5** → 10 kΩ → gate | IRLZ44N | gate | blue |
 | | drain | LED strip | (−) | — |
@@ -85,8 +85,10 @@ old I²C bus (open-drain, 400 pF budget), so the 3 m ceiling is gone.
    │          │                  │           │                  │  GPIO 4 ◄───┼── radar bottom OUT
    │ OUT ─────┼──► GPIO 4        │ OUT ──────┼──► GPIO 6        │  GPIO 6 ◄───┼── radar top OUT
    │ TX  ─────┼──► GPIO 7 (RX)   │ TX  ──────┼──► GPIO 8 (RX)   │  GPIO 7 ◄───┼── radar bottom TX
-   │ RX       │ (unused)         │ RX        │ (unused)         │  GPIO 8 ◄───┼── radar top TX
-   │ GND ─────┼──► GND           │ GND ──────┼──► GND           │  GPIO 1 ◄───┼── LDR tap (ADC)
+   │ RX  ◄────┼──  GPIO 9 (TX)   │ RX  ◄─────┼──  GPIO 10 (TX)  │  GPIO 8 ◄───┼── radar top TX
+   │ GND ─────┼──► GND           │ GND ──────┼──► GND           │  GPIO 9 ────┼──► radar bottom RX (config)
+   │          │                  │           │                  │  GPIO 10 ───┼──► radar top RX (config)
+   │          │                  │           │                  │  GPIO 1 ◄───┼── LDR tap (ADC)
    └──────────┘                  └───────────┘                  │  GPIO 5 ────┼──► IRLZ44N gate (via 10kΩ)
                                                                  │  5V         │
                        3V3 ── LDR ──┬─ GPIO 1 (ADC)              │  GND        │
@@ -99,8 +101,9 @@ old I²C bus (open-drain, 400 pF budget), so the 3 m ceiling is gone.
 
 ### 2c. Notes
 
-- **Radar `RX`** is left unconnected (we only receive; sensitivity is configured
-  via the HLK app or by temporarily wiring RX for UART config commands).
+- **Radar `RX`** is wired to an ESP32 TX pin (GPIO 9 / 10) so the ESP32 can send
+  UART config commands — this is how the sensing distance (max-distance gate) is
+  changed from the dashboard.
 - **LDR divider** gives *brighter = higher ADC*; `lux = (ADC/4095) × LDR_MAX_LUX`,
   threshold `LUX_THRESHOLD` calibrated in `config.h`.
 - **Gate pulldown** (10 kΩ) keeps the MOSFET OFF while the ESP32 boots.
@@ -132,8 +135,8 @@ each is **twisted with a GND return** to reject EMI. Cat6 provides that for free
 |------|---------|---------|
 | 1 (orange) | VCC (5 V) + GND | power |
 | 2 (green) | OUT + GND | presence |
-| 3 (blue) | TX + GND | UART distance |
-| 4 (brown) | RX + GND | spare (future config) |
+| 3 (blue) | TX + GND | UART distance (RX ← radar) |
+| 4 (brown) | RX + GND | UART config (TX → radar, sensing distance) |
 
 - One Cat6 cable **per radar** (bottom and top run back to the controller).
 - 23 AWG solid handles the radar's ~80–100 mA with negligible drop over 20 m.

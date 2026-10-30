@@ -32,11 +32,15 @@
 // BH1750 measurement mode (from BH1750::Mode enum)
 #define LIGHT_SENSOR_MODE   BH1750::CONTINUOUS_HIGH_RES_MODE
 
-// Optional: radar UART — used to read distance (cm) for the dashboard.
+// Optional: radar UART — used to read distance (cm) for the dashboard AND
+// to send configuration commands (e.g. set detection range). The TX line lets
+// the ESP32 reconfigure the radar's sensing distance live from the dashboard.
 // Set USE_RADAR_UART 0 in the sketch if you only want the presence pin.
 #define RADAR_UART_BAUD    256000    // HLK-LD2410 default
 #define RADAR_BOTTOM_RX    7         // ESP32 RX ← bottom radar TX
 #define RADAR_TOP_RX       8         // ESP32 RX ← top radar TX
+#define RADAR_BOTTOM_TX    9         // ESP32 TX → bottom radar RX (config)
+#define RADAR_TOP_TX       10        // ESP32 TX → top radar RX (config)
 
 // ── Light & Motion Thresholds ───────────────────
 // LUX_THRESHOLD compares against the BH1750's real lux reading.
@@ -65,12 +69,13 @@
 #define DURATION_MIN_SEC    5
 #define DURATION_MAX_SEC    1800  // 30 min
 
-// ── Legacy distance-threshold limits (kept for API compatibility) ──
-// With mmWave radar there is no code-configurable presence threshold (the
-// radar's sensitivity is set via its own HLK app). These remain only so the
-// /api/distance endpoint still validates; they no longer affect sensing.
-#define DISTANCE_DEFAULT_MM      70
-#define DISTANCE_MIN_MM          30
-#define DISTANCE_MAX_MM          150
+// ── Sensing distance (radar detection range) ──────
+// Now actually configurable via UART (the radar's "max distance gate").
+// The ESP32 sends a config command to each radar so the detection range can
+// be changed live from the dashboard. Value in centimetres (≈ gate × 75 cm,
+// gate 1..8 → 75..600 cm). HLK-LD2410 max range is ~6 m.
+#define SENSE_DISTANCE_DEFAULT_CM  600   // full range (gate 8)
+#define SENSE_DISTANCE_MIN_CM      75    // gate 1
+#define SENSE_DISTANCE_MAX_CM      600   // gate 8
 
 #endif

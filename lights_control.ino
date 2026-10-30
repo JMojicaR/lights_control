@@ -50,8 +50,7 @@ Preferences prefs;
 
 const char* PREF_NAMESPACE = "stairs";
 const char* PREF_KEY_DURATION = "dur_sec";
-const char* PREF_KEY_DIST_BOTTOM = "dist_bottom_mm";
-const char* PREF_KEY_DIST_TOP = "dist_top_mm";
+const char* PREF_KEY_SENSE = "sense_cm";
 const char* PREF_KEY_POLL = "poll_sec";
 
 // ── Time tracking ───────────────────────────────
@@ -67,8 +66,15 @@ const unsigned long TIME_RESYNC_MS   = TIME_RESYNC_MIN  * 60000UL;
 const unsigned long SUNSET_RESYNC_MS = SUNSET_RESYNC_MIN * 60000UL;
 
 // ── Presence tracking (via mmWave radar OUT pins) ──
+// GATED presence — drives the lights (only accepted at night / lights-off / AUTO).
 bool     presenceBottom  = false;
 bool     presenceTop     = false;
+// RAW motion — always reflects the radar OUT pins (debounced). This is what
+// the dashboard shows, so "where motion was detected" is visible day or night,
+// regardless of override/gating.
+bool     motionBottom    = false;
+bool     motionTop       = false;
+unsigned long motionLastSeen = 0;
 uint16_t distanceBottom  = 0;        // cm (from radar UART, 0 if not parsed)
 uint16_t distanceTop     = 0;        // cm
 unsigned long lastMotionTime = 0;
@@ -87,9 +93,10 @@ unsigned long fadeStartMs = 0;    // When the current fade began
 unsigned long configuredDurationSec = DEFAULT_LIGHT_DURATION_SEC; // Used for new sessions
 unsigned long activeDurationSec     = DEFAULT_LIGHT_DURATION_SEC; // Locked for current session
 
-// ── Dynamic presence distance thresholds (changeable via HTTP) ─
-unsigned long configuredDistanceBottomMm = DISTANCE_DEFAULT_MM;  // bottom sensor presence threshold
-unsigned long configuredDistanceTopMm    = DISTANCE_DEFAULT_MM;  // top sensor presence threshold
+// ── Dynamic sensing distance (changeable via HTTP, applied to the radar) ──
+// Radar detection range in cm. Setting it sends a UART config command to each
+// radar (max distance gate). Shared by both radars.
+unsigned long configuredSensingDistanceCm = SENSE_DISTANCE_DEFAULT_CM;
 
 // ── Dynamic sensor polling interval (changeable via HTTP) ─
 unsigned long configuredPollIntervalSec = POLL_INTERVAL_DEFAULT_SEC;  // seconds between sensor reads
@@ -117,8 +124,7 @@ void setup() {
     // Load persisted settings (fallback to compile-time defaults).
     if (prefs.begin(PREF_NAMESPACE, true)) {
       unsigned long savedDur = prefs.getULong(PREF_KEY_DURATION, DEFAULT_LIGHT_DURATION_SEC);
-      unsigned long savedBottom = prefs.getULong(PREF_KEY_DIST_BOTTOM, DISTANCE_DEFAULT_MM);
-      unsigned long savedTop = prefs.getULong(PREF_KEY_DIST_TOP, DISTANCE_DEFAULT_MM);
+      unsigned long savedSense = prefs.getULong(PREF_KEY_SENSE, SENSE_DISTANCE_DEFAULT_CM);
       unsigned long savedPoll = prefs.getULong(PREF_KEY_POLL, POLL_INTERVAL_DEFAULT_SEC);
       prefs.end();
 
@@ -130,10 +136,8 @@ void setup() {
                 savedDur, configuredDurationSec);
       }
 
-      configuredDistanceBottomMm = (savedBottom >= DISTANCE_MIN_MM && savedBottom <= DISTANCE_MAX_MM)
-                                   ? savedBottom : DISTANCE_DEFAULT_MM;
-      configuredDistanceTopMm    = (savedTop >= DISTANCE_MIN_MM && savedTop <= DISTANCE_MAX_MM)
-                                   ? savedTop : DISTANCE_DEFAULT_MM;
+      configuredSensingDistanceCm = (savedSense >= SENSE_DISTANCE_MIN_CM && savedSense <= SENSE_DISTANCE_MAX_CM)
+                                   ? savedSense : SENSE_DISTANCE_DEFAULT_CM;
       configuredPollIntervalSec  = (savedPoll >= POLL_INTERVAL_MIN_SEC && savedPoll <= POLL_INTERVAL_MAX_SEC)
                                    ? savedPoll : POLL_INTERVAL_DEFAULT_SEC;
     } else {
@@ -142,9 +146,9 @@ void setup() {
               configuredDurationSec);
     }
     activeDurationSec = configuredDurationSec;
-    Serial.printf("[⚙] Loaded: duration %lus | dist bottom %lumm | dist top %lumm | poll %lus\n",
-                  configuredDurationSec, configuredDistanceBottomMm,
-                  configuredDistanceTopMm, configuredPollIntervalSec);
+    Serial.printf("[⚙] Loaded: duration %lus | sensing distance %lucm | poll %lus\n",
+                  configuredDurationSec, configuredSensingDistanceCm,
+                  configuredPollIntervalSec);
 
     // Pins — LED MOSFET uses PWM for fade
     pinMode(STATUS_LED_PIN, OUTPUT);
@@ -165,10 +169,12 @@ void setup() {
     }
 
 #if USE_RADAR_UART
-    // Radar UART (distance in cm for the dashboard) — receive-only.
-    Serial1.begin(RADAR_UART_BAUD, SERIAL_8N1, RADAR_BOTTOM_RX, -1);
-    Serial2.begin(RADAR_UART_BAUD, SERIAL_8N1, RADAR_TOP_RX, -1);
-    Serial.println("[📡] Radar UART enabled (distance reporting)");
+    // Radar UART — receive distance (RX) AND send config commands (TX) so the
+    // sensing distance can be changed from the dashboard.
+    Serial1.begin(RADAR_UART_BAUD, SERIAL_8N1, RADAR_BOTTOM_RX, RADAR_BOTTOM_TX);
+    Serial2.begin(RADAR_UART_BAUD, SERIAL_8N1, RADAR_TOP_RX, RADAR_TOP_TX);
+    Serial.println("[📡] Radar UART enabled (distance reporting + sensing config)");
+    applySensingDistance();   // push the configured range to both radars on boot
 #endif
 
     // PWM setup for LED MOSFET (8-bit, 5 kHz — silent, smooth fade)
@@ -187,7 +193,7 @@ void setup() {
     server.on("/api", handleAPI);
     server.on("/api/override", handleOverride);
     server.on("/api/duration", handleDuration);
-    server.on("/api/distance", handleDistance);
+    server.on("/api/sensing", handleSensing);
     server.on("/api/poll", handlePoll);
     server.onNotFound([]() {
         server.send(404, "application/json", "{\"error\":\"not found\"}");
@@ -488,13 +494,29 @@ void processPresence() {
     unsigned long now = millis();
     bool accept = canAcceptPresence();
 
-    if (digitalRead(RADAR_BOTTOM_PIN) == HIGH && accept && now >= motionDebounceUntil) {
+    // ── RAW motion (dashboard) — always reflects the radar OUT pins ──
+    // This fixes the "movement not reflected in dashboard" bug: presence was
+    // previously gated behind canAcceptPresence() (night + lights-off + AUTO),
+    // so the dashboard showed "clear" even while a person was standing there.
+    bool rawBottom = (digitalRead(RADAR_BOTTOM_PIN) == HIGH);
+    bool rawTop    = (digitalRead(RADAR_TOP_PIN)    == HIGH);
+    if (rawBottom || rawTop) {
+        motionBottom = rawBottom;
+        motionTop    = rawTop;
+        motionLastSeen = now;
+    } else if (now - motionLastSeen > 1500) {   // brief hold to avoid flicker
+        motionBottom = false;
+        motionTop    = false;
+    }
+
+    // ── GATED presence (drives the lights) — unchanged behavior ──
+    if (rawBottom && accept && now >= motionDebounceUntil) {
         if (!presenceBottom) Serial.println("[👣] Presence detected — bottom!");
         presenceBottom = true;
         lastMotionTime = now;
         motionDebounceUntil = now + MOTION_DEBOUNCE_MS;
     }
-    if (digitalRead(RADAR_TOP_PIN) == HIGH && accept && now >= motionDebounceUntil) {
+    if (rawTop && accept && now >= motionDebounceUntil) {
         if (!presenceTop) Serial.println("[👣] Presence detected — top!");
         presenceTop = true;
         lastMotionTime = now;
@@ -570,6 +592,54 @@ void readRadarDistance() {
     while (Serial2.available()) feedRadar(1, (uint8_t)Serial2.read());
     distanceBottom = radarBottom.distance;
     distanceTop    = radarTop.distance;
+}
+
+// ── HLK-LD2410 configuration frame (Host → Radar) ──
+// Frame layout:
+//   FD FC FB FA | len_lo len_hi | cmd_lo cmd_hi | data... | checksum | 04 03 02 01
+//   len = command(2) + data(N) + checksum(1); checksum = sum(command+data) & 0xFF.
+void ld2410SendCommand(HardwareSerial &ser, uint16_t cmdWord, const uint8_t* data, uint8_t dataLen) {
+    uint8_t buf[64];
+    uint8_t idx = 0;
+    uint8_t sum = 0;
+
+    buf[idx++] = 0xFD; buf[idx++] = 0xFC; buf[idx++] = 0xFB; buf[idx++] = 0xFA;
+    buf[idx++] = (uint8_t)(2 + dataLen + 1);  // command + data + checksum
+    buf[idx++] = 0x00;
+    buf[idx++] = (uint8_t)(cmdWord & 0xFF);         // command word, little-endian
+    buf[idx++] = (uint8_t)((cmdWord >> 8) & 0xFF);
+    sum += (uint8_t)(cmdWord & 0xFF);
+    sum += (uint8_t)((cmdWord >> 8) & 0xFF);
+    for (uint8_t i = 0; i < dataLen; i++) {
+        buf[idx++] = data[i];
+        sum += data[i];
+    }
+    buf[idx++] = sum;                               // checksum
+    buf[idx++] = 0x04; buf[idx++] = 0x03; buf[idx++] = 0x02; buf[idx++] = 0x01;
+
+    ser.write(buf, idx);
+}
+
+// Apply the configured sensing distance to both radars.
+// Maps centimetres to the LD2410 "max distance gate" (1..8, ≈75 cm each),
+// then sends the config sequence: enable config → set gate → end config.
+void applySensingDistance() {
+    uint8_t gate = (uint8_t)((configuredSensingDistanceCm + 37) / 75);  // round to nearest gate
+    if (gate < 1) gate = 1;
+    if (gate > 8) gate = 8;
+
+    const uint8_t enableData[2] = {0x01, 0x00};
+
+    ld2410SendCommand(Serial1, 0xFF00, enableData, 2);  // enable config
+    ld2410SendCommand(Serial1, 0x0002, &gate, 1);       // set max distance gate
+    ld2410SendCommand(Serial1, 0xFE01, nullptr, 0);     // end config
+
+    ld2410SendCommand(Serial2, 0xFF00, enableData, 2);
+    ld2410SendCommand(Serial2, 0x0002, &gate, 1);
+    ld2410SendCommand(Serial2, 0xFE01, nullptr, 0);
+
+    Serial.printf("[📡] Radar sensing distance → gate %u (~%lucm)\n",
+                  gate, configuredSensingDistanceCm);
 }
 #endif
 
@@ -688,10 +758,10 @@ void printStatus() {
     char sunsetStr[16];
   formatHHMMFromEpoch(sunsetEpoch, localUtcOffsetSec, sunsetStr, sizeof(sunsetStr));
 
-    Serial.printf("[STATUS] %s | Lux: %.0f | Bottom: %s (%umm) | Top: %s (%umm) | Lights: %s", 
+    Serial.printf("[STATUS] %s | Lux: %.0f | Motion: %s%s | Lights: %s",
                   timeStr, lux,
-                  presenceBottom ? "PRESENT" : "clear", distanceBottom,
-                  presenceTop ? "PRESENT" : "clear", distanceTop,
+                  motionBottom ? "bottom " : "",
+                  motionTop    ? "top"    : (motionBottom ? "" : "none"),
                   currentDuty > 0 ? "ON" : "OFF");
 
     // Remaining time when lights are on (clamped — avoids unsigned underflow)
@@ -701,13 +771,12 @@ void printStatus() {
         Serial.printf(" | Remaining: %lds", remaining);
     }
 
-      Serial.printf(" | Sunset: %s | Mode: %s | Duration(set): %lus | Duration(active): %lus | Dist B/T: %lu/%lumm\n",
+      Serial.printf(" | Sunset: %s | Mode: %s | Duration(set): %lus | Duration(active): %lus | Sensing: %lucm\n",
                   sunsetStr,
                   overrideMode == 1 ? "FORCE ON" : (overrideMode == -1 ? "FORCE OFF" : "AUTO"),
               configuredDurationSec,
               activeDurationSec,
-              configuredDistanceBottomMm,
-              configuredDistanceTopMm);
+              configuredSensingDistanceCm);
 }
 
 // ═════════════════════════════════════════════════
@@ -777,13 +846,13 @@ void handleRoot() {
       <div class="label">☀️ Ambient Light</div>
       <div class="value" id="lux">--</div>
     </div>
-    <div class="tile motion" id="sensorTileB">
-      <div class="label">📏 Distance Bottom</div>
-      <div class="value" id="distB">--</div>
+    <div class="tile motion" id="motionTileB">
+      <div class="label">👣 Motion Bottom</div>
+      <div class="value" id="motionB">clear</div>
     </div>
-    <div class="tile motion" id="sensorTileT">
-      <div class="label">📏 Distance Top</div>
-      <div class="value" id="distT">--</div>
+    <div class="tile motion" id="motionTileT">
+      <div class="label">👣 Motion Top</div>
+      <div class="value" id="motionT">clear</div>
     </div>
     <div class="tile time">
       <div class="label">🕐 Local Time</div>
@@ -806,14 +875,9 @@ void handleRoot() {
   </div>
 
   <div class="duration-row">
-    <label for="distBottomInput">📏 Bottom (mm):</label>
-    <input type="number" id="distBottomInput" min="30" max="150" step="1" value="70">
-    <button class="btn btn-sm" onclick="setDistance('bottom')">Set</button>
-  </div>
-  <div class="duration-row">
-    <label for="distTopInput">📏 Top (mm):</label>
-    <input type="number" id="distTopInput" min="30" max="150" step="1" value="70">
-    <button class="btn btn-sm" onclick="setDistance('top')">Set</button>
+    <label for="senseInput">📡 Sensing (cm):</label>
+    <input type="number" id="senseInput" min="75" max="600" step="25" value="600">
+    <button class="btn btn-sm" onclick="setSensing()">Set</button>
   </div>
 
   <div class="duration-row">
@@ -840,8 +904,7 @@ document.getElementById('ip').textContent = 'http://' + ip + '/';
 let currentOverride = 'auto';
 
 const durInputEl = document.getElementById('durInput');
-const distBottomEl = document.getElementById('distBottomInput');
-const distTopEl = document.getElementById('distTopInput');
+const senseInputEl = document.getElementById('senseInput');
 const pollInputEl = document.getElementById('pollInput');
 
 async function fetchData() {
@@ -865,34 +928,26 @@ async function fetchData() {
     // Lux
     document.getElementById('lux').innerHTML = d.lux.toFixed(0) + ' <small style="font-size:.65rem;opacity:.6">lux</small>';
 
-    // Distance — bottom
-    const sTileB = document.getElementById('sensorTileB');
-    const sMetricB = document.getElementById('distB');
-    const distB_cm = d.distance_bottom_mm ? d.distance_bottom_mm : '--';
-    if (d.presence_bottom) {
-      sTileB.className = 'tile motion active';
-      sMetricB.innerHTML = distB_cm + ' <small style="font-size:.65rem;opacity:.6">cm · PRESENT</small>';
-    } else if (d.distance_bottom_mm > 0) {
-      sTileB.className = 'tile motion';
-      sMetricB.innerHTML = distB_cm + ' <small style="font-size:.65rem;opacity:.6">cm · clear</small>';
+    // Motion — bottom (where motion was detected, not distance)
+    const mTileB = document.getElementById('motionTileB');
+    const mB = document.getElementById('motionB');
+    if (d.motion_bottom) {
+      mTileB.className = 'tile motion active';
+      mB.textContent = 'PRESENT';
     } else {
-      sTileB.className = 'tile motion';
-      sMetricB.textContent = '--';
+      mTileB.className = 'tile motion';
+      mB.textContent = 'clear';
     }
 
-    // Distance — top
-    const sTileT = document.getElementById('sensorTileT');
-    const sMetricT = document.getElementById('distT');
-    const distT_cm = d.distance_top_mm ? d.distance_top_mm : '--';
-    if (d.presence_top) {
-      sTileT.className = 'tile motion active';
-      sMetricT.innerHTML = distT_cm + ' <small style="font-size:.65rem;opacity:.6">cm · PRESENT</small>';
-    } else if (d.distance_top_mm > 0) {
-      sTileT.className = 'tile motion';
-      sMetricT.innerHTML = distT_cm + ' <small style="font-size:.65rem;opacity:.6">cm · clear</small>';
+    // Motion — top
+    const mTileT = document.getElementById('motionTileT');
+    const mT = document.getElementById('motionT');
+    if (d.motion_top) {
+      mTileT.className = 'tile motion active';
+      mT.textContent = 'PRESENT';
     } else {
-      sTileT.className = 'tile motion';
-      sMetricT.textContent = '--';
+      mTileT.className = 'tile motion';
+      mT.textContent = 'clear';
     }
 
     // Time
@@ -925,11 +980,8 @@ async function fetchData() {
     if (document.activeElement !== durInputEl) {
       durInputEl.value = d.duration_sec;
     }
-    if (document.activeElement !== distBottomEl) {
-      distBottomEl.value = d.distance_bottom_mm_set;
-    }
-    if (document.activeElement !== distTopEl) {
-      distTopEl.value = d.distance_top_mm_set;
+    if (document.activeElement !== senseInputEl) {
+      senseInputEl.value = d.sensing_distance_cm;
     }
     if (document.activeElement !== pollInputEl) {
       pollInputEl.value = d.poll_interval_sec;
@@ -977,21 +1029,18 @@ async function setDuration() {
   }
 }
 
-async function setDistance(position) {
-  const el = (position === 'bottom')
-    ? document.getElementById('distBottomInput')
-    : document.getElementById('distTopInput');
-  const mm = el.value;
+async function setSensing() {
+  const cm = senseInputEl.value;
   try {
-    const r = await fetch('/api/distance?position=' + position + '&mm=' + mm, {method:'POST'});
+    const r = await fetch('/api/sensing?cm=' + cm, {method:'POST'});
     const d = await r.json();
     if (d.ok) {
-      el.value = d.distance_mm;
+      senseInputEl.value = d.sensing_distance_cm;
     } else if (d.error) {
       alert(d.error);
     }
   } catch(e) {
-    console.error('Distance error:', e);
+    console.error('Sensing error:', e);
   }
 }
 
@@ -1063,10 +1112,9 @@ void handleAPI() {
     json += "\"lux\":" + String(lux, 1) + ",";
     json += "\"presence_bottom\":" + String(presenceBottom ? "true" : "false") + ",";
     json += "\"presence_top\":" + String(presenceTop ? "true" : "false") + ",";
-    json += "\"distance_bottom_mm\":" + String(distanceBottom) + ",";
-    json += "\"distance_top_mm\":" + String(distanceTop) + ",";
-    json += "\"distance_bottom_mm_set\":" + String(configuredDistanceBottomMm) + ",";
-    json += "\"distance_top_mm_set\":" + String(configuredDistanceTopMm) + ",";
+    json += "\"motion_bottom\":" + String(motionBottom ? "true" : "false") + ",";
+    json += "\"motion_top\":" + String(motionTop ? "true" : "false") + ",";
+    json += "\"sensing_distance_cm\":" + String(configuredSensingDistanceCm) + ",";
     json += "\"time\":\"" + String(timeStr) + "\",";
     json += "\"sunset\":\"" + String(sunsetStr) + "\",";
     json += "\"override\":\"" + String(overrideStr) + "\",";
@@ -1167,62 +1215,46 @@ void handleDuration() {
 }
 
 // ═════════════════════════════════════════════════
-// Distance endpoint — /api/distance
-//   GET  → returns current presence distance thresholds (mm)
-//   POST ?position=bottom|top&mm=N → sets threshold (clamped)
+// Sensing distance endpoint — /api/sensing
+//   GET            → returns current radar sensing distance (cm)
+//   POST ?cm=N     → sets the radar detection range (clamped), applied via UART
 // ═════════════════════════════════════════════════
-void handleDistance() {
-    String position = server.arg("position");
-    position.toLowerCase();
-    bool isBottom = (position == "bottom");
-    bool isTop    = (position == "top");
-    if (!isBottom && !isTop) {
-        server.send(400, "application/json",
-                    "{\"error\":\"missing ?position=bottom|top\"}");
-        return;
-    }
-
-    if (server.method() == HTTP_POST || server.hasArg("mm")) {
-        long newDist = server.arg("mm").toInt();
-        if (newDist < DISTANCE_MIN_MM || newDist > DISTANCE_MAX_MM) {
+void handleSensing() {
+    if (server.method() == HTTP_POST || server.hasArg("cm")) {
+        long newCm = server.arg("cm").toInt();
+        if (newCm < SENSE_DISTANCE_MIN_CM || newCm > SENSE_DISTANCE_MAX_CM) {
             char err[128];
             snprintf(err, sizeof(err),
-                     "{\"error\":\"distance must be %d–%d mm\"}",
-                     DISTANCE_MIN_MM, DISTANCE_MAX_MM);
+                     "{\"error\":\"sensing distance must be %d–%d cm\"}",
+                     SENSE_DISTANCE_MIN_CM, SENSE_DISTANCE_MAX_CM);
             server.send(400, "application/json", err);
             return;
         }
 
-        // NOTE: with mmWave radar there is no code-configurable presence
-        // threshold — the radar's sensitivity is set via its own HLK app. This
-        // value is kept for API compatibility only (no longer affects sensing).
-        if (isBottom) {
-            configuredDistanceBottomMm = (unsigned long)newDist;
-        } else {
-            configuredDistanceTopMm = (unsigned long)newDist;
-        }
+        configuredSensingDistanceCm = (unsigned long)newCm;
+        Serial.printf("[⚙] Sensing distance set to %lucm (HTTP)\n",
+                      configuredSensingDistanceCm);
 
-        Serial.printf("[⚙] Distance %s set to %lumm (HTTP)\n",
-                      isBottom ? "bottom" : "top",
-                      isBottom ? configuredDistanceBottomMm : configuredDistanceTopMm);
+#if USE_RADAR_UART
+        applySensingDistance();   // reconfigure both radars immediately
+#endif
 
+        bool persisted = false;
         if (prefs.begin(PREF_NAMESPACE, false)) {
-            prefs.putULong(PREF_KEY_DIST_BOTTOM, configuredDistanceBottomMm);
-            prefs.putULong(PREF_KEY_DIST_TOP, configuredDistanceTopMm);
+            persisted = (prefs.putULong(PREF_KEY_SENSE, configuredSensingDistanceCm) > 0);
             prefs.end();
         }
 
         char resp[160];
         snprintf(resp, sizeof(resp),
-                 "{\"position\":\"%s\",\"distance_mm\":%lu,\"ok\":true}",
-                 isBottom ? "bottom" : "top",
-                 isBottom ? configuredDistanceBottomMm : configuredDistanceTopMm);
+                 "{\"sensing_distance_cm\":%lu,\"persisted\":%s,\"ok\":true}",
+                 configuredSensingDistanceCm, persisted ? "true" : "false");
         server.send(200, "application/json", resp);
     } else {
-        char resp[160];
+        char resp[128];
         snprintf(resp, sizeof(resp),
-                 "{\"distance_bottom_mm\":%lu,\"distance_top_mm\":%lu}",
-                 configuredDistanceBottomMm, configuredDistanceTopMm);
+                 "{\"sensing_distance_cm\":%lu}",
+                 configuredSensingDistanceCm);
         server.send(200, "application/json", resp);
     }
 }

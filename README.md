@@ -30,10 +30,10 @@ Any condition false ────────────────▶ LIGHTS O
    A motion debounce (default 2 s) ignores re-triggers while the lights are on.
 5. **Manual override** via web dashboard — force ON / OFF / AUTO.
 
-Presence is read by polling each radar's OUT pin (debounced), and the radars'
-UART reports **live distance in mm** to the dashboard (best-effort, independent
-of the presence logic). The BH1750 is polled (**5 s by default**, configurable),
-since lux changes slowly.
+Presence is read by polling each radar's OUT pin (debounced). The radar UART
+also carries **configuration commands** — the sensing distance (detection range)
+is set live from the dashboard via the radar's max-distance gate. The BH1750 is
+polled (**5 s by default**, configurable), since lux changes slowly.
 
 ### Why mmWave radar instead of PIR?
 
@@ -87,25 +87,28 @@ Open `http://<esp32-ip>/` in any browser on the same network.
 
 | Tile | Description |
 |------|-------------|
-| **Live status** | Lights ON/OFF, ambient lux, radar distance (mm) bottom/top, presence, local time, sunset |
+| **Live status** | Lights ON/OFF, ambient lux, **motion location (bottom/top)**, local time, sunset |
 | **Manual override** | Force ON, Force OFF, or return to AUTO mode |
 | **Uptime & RSSI** | Device uptime and WiFi signal strength |
-| **Duration / Poll** | Set light duration (s) and ambient-light (BH1750) polling interval (s), persisted to NVS |
+| **Duration / Poll / Sensing** | Set light duration (s), ambient-light (BH1750) polling interval (s), and radar **sensing distance (cm)** — all persisted to NVS |
 | **JSON API** | `GET /api` returns machine-readable JSON |
 | **Override API** | `GET /api/override?mode=on\|off\|auto` |
 | **Duration API** | `POST /api/duration?seconds=N` |
 | **Poll API** | `POST /api/poll?seconds=N` |
+| **Sensing API** | `POST /api/sensing?cm=N` — sets the radar detection range live |
 | **Auto-refresh** | Dashboard polls every 2 seconds |
 
-> `/api/distance` remains for backwards compatibility — it validates the request
-> but **no longer affects sensing** (radar sensitivity is set via the HLK app).
+> The dashboard shows **where motion was detected** (bottom / top) rather than
+> the radar's distance reading. The radar's sensing distance is now changed from
+> the dashboard (it sends a UART config command to the radar's max-distance gate).
 
 ### API Examples
 
 ```bash
 curl http://192.168.1.42/api
 # → {"lights_on":false,"duty":0,"lux":3.5,"presence_bottom":true,"presence_top":false,
-#    "distance_bottom_mm":450,"distance_top_mm":2100,"time":"14:30","sunset":"19:15",...}
+#    "motion_bottom":true,"motion_top":false,"sensing_distance_cm":600,
+#    "time":"14:30","sunset":"19:15",...}
 
 curl "http://192.168.1.42/api/override?mode=on"    # → {"override":"on","lights_on":true}
 curl "http://192.168.1.42/api/override?mode=auto"  # → {"override":"auto","lights_on":false}
@@ -132,9 +135,11 @@ curl -X POST "http://192.168.1.42/api/poll?seconds=10"        # set BH1750 poll 
 ESP32-S3               Peripheral
 ────────               ──────────
 GPIO 4   ───────────── Radar BOTTOM OUT   (presence, HIGH = present)
-GPIO 7   ───────────── Radar BOTTOM TX    (UART distance, 256000 baud)
+GPIO 7   ───────────── Radar BOTTOM TX    (UART RX ← radar, 256000 baud)
+GPIO 9   ───────────── Radar BOTTOM RX    (UART TX → radar, config commands)
 GPIO 6   ───────────── Radar TOP OUT
-GPIO 8   ───────────── Radar TOP TX
+GPIO 8   ───────────── Radar TOP TX       (UART RX ← radar, 256000 baud)
+GPIO 10  ───────────── Radar TOP RX       (UART TX → radar, config commands)
 GPIO 12  ───────────── BH1750 SDA
 GPIO 13  ───────────── BH1750 SCL
 GPIO 5   ──[10 kΩ]──┬─ IRLZ44N GATE   (10 kΩ pulldown to GND keeps it OFF at boot)
@@ -229,9 +234,10 @@ Edit `config.h` before flashing:
 #define POLL_INTERVAL_DEFAULT_SEC  5
 ```
 
-Light duration and the BH1750 polling interval can be changed live from the
-dashboard (persisted to NVS, survive reboot). Radar sensitivity/detection gates
-are configured via the **HLK app** (or UART), not the ESP32.
+Light duration, the BH1750 polling interval, and the radar sensing distance
+(detection range) can be changed live from the dashboard (persisted to NVS,
+survive reboot). The sensing distance is applied by sending a UART config
+command to each radar's max-distance gate.
 
 ## Build & Flash
 
