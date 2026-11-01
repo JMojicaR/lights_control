@@ -21,7 +21,7 @@
 // and the reason they replace the VL53L0X ToF sensors).
 #define RADAR_BOTTOM_PIN   4   // bottom radar OUT → ESP32 GPIO 4
 #define RADAR_TOP_PIN      6   // top radar OUT    → ESP32 GPIO 6
-#define LED_MOSFET_PIN     5   // IRLZ44N gate for 12V LED strip
+#define LED_MOSFET_PIN     5   // IRLZ44N gate for 5V LED strip (low-side switch)
 #define STATUS_LED_PIN     2   // Built-in LED (2 = most ESP32-S3 SuperMini)
 
 // Ambient light: BH1750 (I²C) — placed < 30 cm from the ESP32, so the short

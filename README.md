@@ -1,6 +1,6 @@
 # Staircase Light Controller — ESP32-S3 (mmWave radar + BH1750)
 
-Automatically controls a 12V LED strip on a 5m staircase using **HLK-LD2410B/C
+Automatically controls a 5V LED strip on a staircase using **HLK-LD2410B/C
 mmWave radar** for presence detection, a **BH1750** ambient-light sensor, and
 time-of-day logic (sunset API). Includes a **web dashboard** for live monitoring
 and manual override.
@@ -125,9 +125,9 @@ curl -X POST "http://192.168.1.42/api/poll?seconds=10"        # set BH1750 poll 
 | HLK-LD2410B/C radar (bottom) | Presence detection | OUT → GPIO 4, TX → GPIO 7 (RX) |
 | HLK-LD2410B/C radar (top) | Presence detection | OUT → GPIO 6, TX → GPIO 8 (RX) |
 | BH1750 | Ambient light sensor | I²C SDA 12, SCL 13 |
-| IRLZ44N MOSFET | Switch 12 V LED strip | Gate → GPIO 5 |
-| 12 V LED strip (5 m) | Staircase lighting | MOSFET drain |
-| 12 V DC PSU (≥6 A) | Power for LED strip + buck | — |
+| IRLZ44N MOSFET | Switch 5 V LED strip (low-side) | Gate → GPIO 5 |
+| 5 V LED strip (USB-A plug) | Staircase lighting | USB-A port (switched GND) |
+| 5 V 2 A USB charger | Powers everything (ESP32 + radars + strip) | — |
 
 ### Wiring (pin-by-pin)
 
@@ -148,8 +148,11 @@ GPIO 5   ──[10 kΩ]──┬─ IRLZ44N GATE   (10 kΩ pulldown to GND keeps
 3.3 V    ───────────── BH1750 VCC
 GND      ───────────── Radar GND (×2), BH1750 GND
 
-12 V PSU (+) ─── LED strip (+) ─── LED strip (−) ─── IRLZ44N DRAIN
-12 V PSU (−) ─── IRLZ44N SOURCE ─── GND (common)
+5 V USB (+) ──┬── ESP32 5 V pin
+              ├── Radar VCC (×2)
+              └── LED strip (+)      (USB-A VBUS)
+LED strip (−) ─── IRLZ44N DRAIN      (USB-A GND, low-side switched)
+IRLZ44N SOURCE ─── GND (common)
 ```
 
 ## Electrical & Wiring Considerations (Cat6 / Ethernet cable)
@@ -194,7 +197,8 @@ which is exactly what rejects EMI on a 15–30 m digital run.
 - At 20 m of 23 AWG the 5 V drop at ~80–100 mA is negligible (~0.15 V). For
   > 30 m, run 12 V and regulate to 5 V **at each radar**.
 - UART at 256 kbps is trivial over 30 m; drop to 115200/9600 for noisy long runs.
-- Fuse the **12 V feed (3 A)** and star-ground everything at one point.
+- One **5 V / 2 A USB charger** feeds everything: strip 1–1.5 A + 2 radars ≈0.2 A
+  + ESP32 ≈0.15 A ≈ 1.85 A max (within 2 A). Star-ground at one point.
 - The MOSFET gate needs a **10 kΩ pulldown to GND** so the strip stays off while
   the ESP32 boots.
 - **LD2410C is drop-in** for LD2410B (same OUT + UART + protocol); check the pin

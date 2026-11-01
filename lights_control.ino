@@ -2,7 +2,7 @@
  * Staircase Light Controller — ESP32-S3 SuperMini (mmWave radar + BH1750 option)
  * ===========================================================================
  *
- * Automatically controls a 12V LED strip on a 5m staircase based on:
+ * Automatically controls a 5V LED strip on a staircase based on:
  *   1. Presence detection (HLK-LD2410B mmWave radar — moving OR stationary)
  *   2. Ambient light level (BH1750 I²C sensor)
  *   3. Time of day vs sunset (HTTP APIs)
@@ -25,8 +25,8 @@
  *   - HLK-LD2410B mmWave radar — bottom (OUT GPIO 4, UART RX GPIO 7)
  *   - HLK-LD2410B mmWave radar — top    (OUT GPIO 6, UART RX GPIO 8)
  *   - BH1750 ambient light sensor (I²C: SDA 12, SCL 13)
- *   - IRLZ44N MOSFET switching 12V LED strip (GPIO 5)
- *   - 12V DC power supply (≥6A for 5m strip)
+ *   - IRLZ44N MOSFET switching 5V LED strip (GPIO 5, low-side)
+ *   - 5V 2A USB phone charger powers the whole system (ESP32 + 2 radars + strip)
  */
 
 #include "config.h"

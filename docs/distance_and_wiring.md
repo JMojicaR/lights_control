@@ -62,37 +62,36 @@ old I²C bus (open-drain, 400 pF budget), so the 3 m ceiling is gone.
 | **MOSFET** | ESP32-S3 **GPIO 5** → 10 kΩ → gate | IRLZ44N | gate | blue |
 | | drain | LED strip | (−) | — |
 | | source | GND | — | — |
-| **LED strip** | 12 V PSU (+) | strip | (+) | red |
+| **LED strip** | 5 V rail (+) | strip | (+) | red |
 | | strip (−) | MOSFET drain | — | — |
-| **Power** | 12 V PSU | buck 12 V→5 V | → ESP32 5 V + radar VCC | — |
+| **Power** | 5 V USB charger | → +5 V rail | → ESP32 5 V + radar VCC + strip (+) | — |
 
 ### 2b. ASCII wiring diagram
 
 ```
-                    12 V PSU (+12V) ──────────────────────► LED strip (+)
-                    12 V PSU (GND)  ──┬──────────────────► (common GND)
-                                       │
-                       ┌───────────────┴────────────────────────┐
-                       │  buck 12 V → 5 V  (or 5 V regulator)  │
-                       └───────────────┬────────────────────────┘
-                                       │ 5 V
-        ┌──────────────────────────────┼───────────────────────────────┐
-        │ 5V                           │ 5V                            │
-   ┌────┴─────┐                  ┌─────┴─────┐                  ┌──────┴──────┐
+                    5 V USB charger (+) ──┬──────────────────► LED strip (+)
+                                          ├──────────────────► ESP32 5 V pin
+                                          └──────────────────► radar VCC (×2)
+                    5 V USB charger (GND) ───────────────────► common GND
+
+   ┌──────────┐                  ┌───────────┐                  ┌─────────────┐
    │ RADAR    │                  │ RADAR     │                  │  ESP32-S3   │
    │ BOTTOM   │                  │ TOP       │                  │  SuperMini  │
    │ LD2410B  │                  │ LD2410B   │                  │             │
-   │          │                  │           │                  │  GPIO 4 ◄───┼── radar bottom OUT
-   │ OUT ─────┼──► GPIO 4        │ OUT ──────┼──► GPIO 6        │  GPIO 6 ◄───┼── radar top OUT
-   │ TX  ─────┼──► GPIO 7 (RX)   │ TX  ──────┼──► GPIO 8 (RX)   │  GPIO 7 ◄───┼── radar bottom TX
-   │ RX  ◄────┼──  GPIO 9 (TX)   │ RX  ◄─────┼──  GPIO 10 (TX)  │  GPIO 8 ◄───┼── radar top TX
-   │ GND ─────┼──► GND           │ GND ──────┼──► GND           │  GPIO 9 ────┼──► radar bottom RX (config)
-   │          │                  │           │                  │  GPIO 10 ───┼──► radar top RX (config)
-   │          │                  │           │                  │  GPIO 1 ◄───┼── LDR tap (ADC)
-   └──────────┘                  └───────────┘                  │  GPIO 5 ────┼──► IRLZ44N gate (via 10kΩ)
-                                                                 │  5V         │
-                       3V3 ── LDR ──┬─ GPIO 1 (ADC)              │  GND        │
-                                    └─ 10 kΩ ── GND              └─────────────┘
+   │ OUT ─────┼──► GPIO 4        │ OUT ──────┼──► GPIO 6        │  GPIO 4 ◄───┼── radar bottom OUT
+   │ TX  ─────┼──► GPIO 7 (RX)   │ TX  ──────┼──► GPIO 8 (RX)   │  GPIO 6 ◄───┼── radar top OUT
+   │ RX  ◄────┼──  GPIO 9 (TX)   │ RX  ◄─────┼──  GPIO 10 (TX)  │  GPIO 7 ◄───┼── radar bottom TX
+   │ GND ─────┼──► GND           │ GND ──────┼──► GND           │  GPIO 8 ◄───┼── radar top TX
+   └──────────┘                  └───────────┘                  │  GPIO 9 ────┼──► radar bottom RX (config)
+                                                                 │  GPIO 10 ───┼──► radar top RX (config)
+                                                                 │  GPIO 12 ◄──┼── BH1750 SDA
+                                                                 │  GPIO 13 ◄──┼── BH1750 SCL
+                                                                 │  GPIO 5 ────┼──► IRLZ44N gate (10kΩ)
+                                                                 │  3V3 ───────┼──► BH1750 VCC
+                                                                 │  GND        │
+                                                                 └─────────────┘
+
+    BH1750:   VCC ── 3V3     SDA ── GPIO 12     SCL ── GPIO 13     GND ── GND
 
     IRLZ44N:  gate ──(10kΩ pulldown to GND)── GPIO 5
               drain ──► LED strip (−)
@@ -107,7 +106,8 @@ old I²C bus (open-drain, 400 pF budget), so the 3 m ceiling is gone.
 - **LDR divider** gives *brighter = higher ADC*; `lux = (ADC/4095) × LDR_MAX_LUX`,
   threshold `LUX_THRESHOLD` calibrated in `config.h`.
 - **Gate pulldown** (10 kΩ) keeps the MOSFET OFF while the ESP32 boots.
-- **Fuse the 12 V feed (3 A)** and star-ground everything at one point.
+- **Single 5 V / 2 A USB charger** feeds everything (strip 1–1.5 A + radars +
+  ESP32 ≈ 1.85 A max). Star-ground everything at one point.
 - Radars run on **5 V** (not 3.3 V) — do not feed them from the ESP32's 3V3 pin.
 - **LD2410C is a drop-in** for the LD2410B (same OUT + UART + 256 kbps protocol),
   with breadboard-friendly 2.54 mm pins and built-in BLE for app configuration.
