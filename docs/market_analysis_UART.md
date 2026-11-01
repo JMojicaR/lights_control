@@ -25,7 +25,7 @@ cliff from the earlier analyses and is the whole point of the kit strategy.
 | SKU | Contents | Retail |
 |-----|----------|--------|
 | **Core kit** | main board + 2 radars + BH1750 + RJ45 adapters + Cat6 cables + instructions | **$1,499** |
-| **Complete kit** | core kit + 12 V LED strip + 12 V PSU + enclosures + hardware | **$1,899** |
+| **Complete kit** | core kit + 5 V USB LED strip + USB charger + enclosures + hardware | **$1,899** |
 
 ---
 
@@ -63,7 +63,7 @@ framing also *unlocks the market now* (no certification lead time).
 | Dual mmWave detects still people (better than PIR/ToF) | Kit = customer does the assembly (support load) |
 | Cat6/RJ45 — no soldering, foolproof wiring | Smaller "maker" market vs mass consumer |
 | No certification needed to sell (kit) | Lower perceived polish vs finished product |
-| Real lux (BH1750) + web dashboard + API | Requires a 12 V feed + wiring near stairs |
+| Real lux (BH1750) + web dashboard + API | Requires a 5 V USB feed near the stairs |
 
 | Opportunities | Threats |
 |---------------|---------|
@@ -91,7 +91,7 @@ customer just plugs in standard Ethernet patch cables.
 | 5 | **RJ45 PCB-mount jack (Cat6)** | 2 | $15 | $30 |
 | 6 | **Radar adapter PCB (RJ45 + 5-pin header)** | 2 | $30 | $60 |
 | 7 | **Cat6 patch cable 3 m** | 2 | $30 | $60 |
-| 8 | Screw terminals + passives (resistors, 5 V reg) | 1 set | $30 | $30 |
+| 8 | Screw terminals + passives (resistors) | 1 set | $30 | $30 |
 | 9 | Main enclosure | 1 | $80 | $80 |
 | 10 | Radar enclosures | 2 | $40 | $80 |
 | 11 | Instructions + packaging | 1 | $60 | $60 |
@@ -102,20 +102,20 @@ customer just plugs in standard Ethernet patch cables.
 
 | # | Component | Qty | Unit | Total |
 |---|-----------|-----|------|-------|
-| 13 | 12 V LED strip 5 m (5050) | 1 | $250 | $250 |
-| 14 | 12 V PSU 6 A | 1 | $220 | $220 |
-| | **Complete kit total** | | | **$1,565** |
+| 13 | 5 V LED strip (USB-A, white) | 1 | $200 | $200 |
+| 14 | 5 V / 2 A USB charger | 1 | $120 | $120 |
+| | **Complete kit total** | | | **$1,415** |
 
 ### 3c. Mass production (custom PCB + bulk radar)
 
 | Scenario | Core kit | Complete kit |
 |----------|----------|--------------|
-| Small batch (100) | $1,095 | $1,565 |
-| **Mass production (1,000)** | **~$460** | **~$650** |
+| Small batch (100) | $1,095 | $1,415 |
+| **Mass production (1,000)** | **~$460** | **~$560** |
 
-At scale the custom PCB integrates the ESP32-S3 module, BH1750, 5 V regulator,
-MOSFET and the two RJ45 jacks on one board (~$150 assembled); radar modules drop
-to ~$80 each in bulk.
+At scale the custom PCB integrates the ESP32-S3 module, BH1750, MOSFET and the
+two RJ45 jacks on one board (~$140 assembled — no regulator needed on a 5 V
+system); radar modules drop to ~$80 each in bulk.
 
 ---
 
@@ -125,26 +125,26 @@ to ~$80 each in bulk.
 
 | | Core kit | Complete kit |
 |---|---|---|
-| Small batch | $1,095 | $1,565 |
-| Mass production | $460 | $650 |
+| Small batch | $1,095 | $1,415 |
+| Mass production | $460 | $560 |
 
 ### 4b. Unit economics (direct sale)
 
 ```
                         Core kit        Complete kit
 Retail price:            $1,499           $1,899
-- COGS (mass prod):        $460             $650
+- COGS (mass prod):        $460             $560
 - Payment processing (3%):  $45              $57
 - Shipping:                $120             $130
 - Support:                  $20              $20
 - Marketing (CAC):          $50              $60
 ──────────────────────────────────────────────────
-Net profit / unit:         $804             $982
-Gross margin:              53.6%            51.7%
+Net profit / unit:         $804           $1,072
+Gross margin:              53.6%            56.5%
 ```
 
-Small-batch margins are thin (~11% core / ~5% complete) — the business case,
-as always, is the mass-production COGS.
+Small-batch margins are thin (~11%) — the business case, as always, is the
+mass-production COGS.
 
 ---
 
@@ -174,7 +174,7 @@ as always, is the mass-production COGS.
 ```
 Fixed costs:             $77,200
 Gross profit (core kit):    $804  → break-even ≈  96 units
-Gross profit (complete):    $982  → break-even ≈  79 units
+Gross profit (complete):  $1,072  → break-even ≈  72 units
 ```
 
 | Scenario | Units/mo | Break-even | Year 1 profit/loss |
@@ -220,9 +220,9 @@ the growing maker/Home-Assistant audience, and sidesteps the regulatory cliff.
 
 | | I²C finished (baseline) | **UART/mmWave DIY kit (this branch)** |
 |---|---|---|
-| BOM (mass prod) | $790 | **$460 (core) / $650 (complete)** |
+| BOM (mass prod) | $790 | **$460 (core) / $560 (complete)** |
 | Fixed costs | $157,200 (certified) | **$77,200 (no cert)** |
-| Break-even | ~322 units | **~79–96 units** |
+| Break-even | ~322 units | **~72–96 units** |
 | Retail | $1,699 | $1,499 / $1,899 |
 | Still-person detection | narrow beam | **wider cone + micro-motion** |
 | Wiring | I²C (address + pull-ups) | **Cat6/RJ45, no solder** |
