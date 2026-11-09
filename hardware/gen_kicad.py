@@ -61,32 +61,41 @@ SYMBOLS = {
     },
 }
 
+def sym_def(name, spec):
+    """Return the (symbol ...) definition lines — used in the .kicad_sym library
+    AND embedded in the .kicad_sch so the schematic is self-contained."""
+    x1, y1, x2, y2 = spec["rect"]
+    lines = [f'  (symbol "{name}"',
+             '    (pin_numbers hide)',
+             '    (pin_names (offset 1.016) hide)',
+             '    (exclude_from_sim no)',
+             '    (in_bom yes)',
+             '    (on_board yes)',
+             f'    (property "Reference" "{spec["ref"]}" (at 0 {y2-2.54} 0) (effects (font (size 1.27 1.27))))',
+             f'    (property "Value" "{spec["value"]}" (at 0 {y1+2.54} 0) (effects (font (size 1.27 1.27))))',
+             '    (property "Footprint" "" (at 0 0 0) (effects (font (size 1.27 1.27)) hide))',
+             '    (property "Datasheet" "" (at 0 0 0) (effects (font (size 1.27 1.27)) hide))',
+             f'    (symbol "{name}_1_1"',
+             '      (pin_names (offset 1.016) hide)',
+             f'      (rectangle (start {x1} {y1}) (end {x2} {y2}) (stroke (width 0.254) (type default)) (fill (type background)))']
+    for pn, pnum, px, py in spec["pins"]:
+        etype = "passive"
+        if pn in ("5V", "VCC", "3V3", "VBUS"):
+            etype = "power_in"
+        if pn == "GND":
+            etype = "power_in"
+        lines.append(f'      (pin {etype} line (at {px} {py} 0) (length 2.54) '
+                     f'(name "{pn}" (effects (font (size 1.27 1.27)))) '
+                     f'(number "{pnum}" (effects (font (size 1.27 1.27)))))')
+    lines.append('    )')
+    lines.append('  )')
+    return lines
+
+
 def gen_symbols():
     out = ['(kicad_symbol_lib', '  (version 20251024)', '  (generator "eeschema")']
     for name, spec in SYMBOLS.items():
-        x1, y1, x2, y2 = spec["rect"]
-        out.append(f'  (symbol "{name}"')
-        out.append('    (pin_numbers hide)')
-        out.append('    (pin_names (offset 1.016) hide)')
-        out.append('    (exclude_from_sim no)')
-        out.append('    (in_bom yes)')
-        out.append('    (on_board yes)')
-        out.append(f'    (property "Reference" "{spec["ref"]}" (at 0 {y2-2.54} 0) (effects (font (size 1.27 1.27))))')
-        out.append(f'    (property "Value" "{spec["value"]}" (at 0 {y1+2.54} 0) (effects (font (size 1.27 1.27))))')
-        out.append('    (property "Footprint" "" (at 0 0 0) (effects (font (size 1.27 1.27)) hide))')
-        out.append('    (property "Datasheet" "" (at 0 0 0) (effects (font (size 1.27 1.27)) hide))')
-        out.append(f'    (symbol "{name}_1_1"')
-        out.append('      (pin_names (offset 1.016) hide)')
-        out.append(f'      (rectangle (start {x1} {y1}) (end {x2} {y2}) (stroke (width 0.254) (type default)) (fill (type background)))')
-        for pn, pnum, px, py in spec["pins"]:
-            etype = "passive"
-            if pn in ("5V","VCC","3V3","VBUS"): etype = "power_in"
-            if pn == "GND": etype = "power_in"
-            out.append(f'      (pin {etype} line (at {px} {py} 0) (length 2.54) '
-                       f'(name "{pn}" (effects (font (size 1.27 1.27)))) '
-                       f'(number "{pnum}" (effects (font (size 1.27 1.27)))))')
-        out.append('    )')
-        out.append('  )')
+        out.extend(sym_def(name, spec))
     out.append(')')
     with open(SYM, "w") as f:
         f.write('\n'.join(out) + '\n')
@@ -162,7 +171,7 @@ PIN_NETS = {
 # Schematic
 # =========================================================================
 def gen_schematic():
-    out = ['(kicad_sch (version 20251024) (generator "eeschema")',
+    out = ['(kicad_sch (version 20260306) (generator "eeschema")',
            f'  (uuid "{u()}")',
            '  (paper "A3")',
            '  (lib_symbols)']
