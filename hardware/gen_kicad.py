@@ -62,7 +62,7 @@ SYMBOLS = {
 }
 
 def gen_symbols():
-    out = ['(kicad_symbol_lib', '  (version 20231120)', '  (generator "hermes")']
+    out = ['(kicad_symbol_lib', '  (version 20251024)', '  (generator "eeschema")']
     for name, spec in SYMBOLS.items():
         x1, y1, x2, y2 = spec["rect"]
         out.append(f'  (symbol "{name}"')
@@ -108,7 +108,7 @@ FOOTPRINTS = {
 def gen_footprints():
     for name, spec in FOOTPRINTS.items():
         tht = spec["tht"]
-        out = [f'(footprint "{name}" (version 20240108) (generator "hermes")',
+        out = [f'(footprint "{name}" (version 20260206) (generator "pcbnew")',
                '  (layer "F.Cu")',
                f'  (attr {"through_hole" if tht else "smd"})',
                '  (fp_text reference "REF**" (at 0 -3.5 0) (layer "F.Silkscreen") (effects (font (size 1 1) (thickness 0.15))))',
@@ -162,7 +162,7 @@ PIN_NETS = {
 # Schematic
 # =========================================================================
 def gen_schematic():
-    out = ['(kicad_sch (version 20231120) (generator "hermes")',
+    out = ['(kicad_sch (version 20251024) (generator "eeschema")',
            f'  (uuid "{u()}")',
            '  (paper "A3")',
            '  (lib_symbols)']
@@ -200,7 +200,7 @@ def gen_pcb():
             "RADAR_BOTTOM_TX", "RADAR_BOTTOM_RX", "RADAR_TOP_OUT", "RADAR_TOP_TX",
             "RADAR_TOP_RX", "LED_GATE", "STRIP_MINUS", "LED_STATUS", "LED_A"]
     net_idx = {n: i for i, n in enumerate(nets)}
-    out = ['(kicad_pcb (version 20240108) (generator "hermes")',
+    out = ['(kicad_pcb (version 20260206) (generator "pcbnew")',
            '  (general (thickness 1.6))',
            '  (paper "A4")',
            '  (layers',
@@ -267,10 +267,18 @@ def gen_pcb():
 # Project + lib tables
 # =========================================================================
 def gen_project():
-    pro = ['(kicad_project', '  (version 1)', '  (date 2026-10-17)',
-           '  (title "lights_control uart_option")', '  (author "Hermes")', ')']
+    pro = ('{\n'
+           '  "meta": {\n'
+           '    "filename": "lights_control.kicad_pro",\n'
+           '    "version": 3\n'
+           '  },\n'
+           '  "libraries": {\n'
+           '    "pinned_symbol_libs": ["lights_control"],\n'
+           '    "pinned_footprint_libs": ["lights_control"]\n'
+           '  }\n'
+           '}\n')
     with open(PRO, "w") as f:
-        f.write('\n'.join(pro) + '\n')
+        f.write(pro)
     symt = ['(sym_lib_table', '  (version 7)',
             '  (lib (name "lights_control") (type "KiCad") (uri "${KIPRJMOD}/lights_control.kicad_sym") (options "") (descr "custom symbols"))',
             ')']

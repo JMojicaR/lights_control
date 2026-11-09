@@ -1,6 +1,10 @@
-(kicad_project
-  (version 1)
-  (date 2026-10-17)
-  (title "lights_control uart_option")
-  (author "Hermes")
-)
+{
+  "meta": {
+    "filename": "lights_control.kicad_pro",
+    "version": 3
+  },
+  "libraries": {
+    "pinned_symbol_libs": ["lights_control"],
+    "pinned_footprint_libs": ["lights_control"]
+  }
+}
