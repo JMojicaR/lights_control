@@ -272,12 +272,12 @@ def gen_project():
     with open(PRO, "w") as f:
         f.write('\n'.join(pro) + '\n')
     symt = ['(sym_lib_table', '  (version 7)',
-            f'  (lib (name "lights_control") (type "KiCad") (uri "{SYM}") (options "") (descr "custom symbols"))',
+            '  (lib (name "lights_control") (type "KiCad") (uri "${KIPRJMOD}/lights_control.kicad_sym") (options "") (descr "custom symbols"))',
             ')']
     with open(os.path.join(HERE, "sym-lib-table"), "w") as f:
         f.write('\n'.join(symt) + '\n')
     fpt = ['(fp_lib_table', '  (version 7)',
-           f'  (lib (name "lights_control") (type "KiCad") (uri "{PRETTY}") (options "") (descr "custom footprints"))',
+           '  (lib (name "lights_control") (type "KiCad") (uri "${KIPRJMOD}/lights_control.pretty") (options "") (descr "custom footprints"))',
            ')']
     with open(os.path.join(HERE, "fp-lib-table"), "w") as f:
         f.write('\n'.join(fpt) + '\n')
