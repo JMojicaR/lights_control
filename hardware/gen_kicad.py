@@ -237,9 +237,9 @@ def gen_pcb():
             ni = net_idx.get(net, 0)
             netsfx = f' (net {ni} "{net}")' if net else ''
             if tht:
-                out.append(f'    (pad "{pn}" thru_hole circle (at {fpx+px:.2f} {fpy+py:.2f}) (size 1.7 1.7) (drill 1.0) (layers "*.Cu" "*.Mask"){netsfx} (uuid "{u()}"))')
+                out.append(f'    (pad "{pn}" thru_hole circle (at {px:.2f} {py:.2f}) (size 1.7 1.7) (drill 1.0) (layers "*.Cu" "*.Mask"){netsfx} (uuid "{u()}"))')
             else:
-                out.append(f'    (pad "{pn}" smd rect (at {fpx+px:.2f} {fpy+py:.2f}) (size 1.0 0.6) (layers "F.Cu" "F.Paste" "F.Mask"){netsfx} (uuid "{u()}"))')
+                out.append(f'    (pad "{pn}" smd rect (at {px:.2f} {py:.2f}) (size 1.0 0.6) (layers "F.Cu" "F.Paste" "F.Mask"){netsfx} (uuid "{u()}"))')
         out.append('  )')
     # routing: chain-connect pads per net
     net_pads = {}
