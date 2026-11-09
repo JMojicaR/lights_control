@@ -3,6 +3,6 @@
   (attr through_hole)
   (fp_text reference "REF**" (at 0 -3.5 0) (layer "F.Silkscreen") (effects (font (size 1 1) (thickness 0.15))))
   (fp_text value "VAL**" (at 0 3.5 0) (layer "F.Fab") (effects (font (size 1 1) (thickness 0.15))))
-  (pad "1" thru_hole circle (at 0.0 2.54) (size 1.7 1.7) (drill 1.0) (layers "*.Cu" "*.Mask") (remove_unused_layers) (uuid "9b64876a-1dbf-43eb-8da0-19c5b912bab4"))
-  (pad "2" thru_hole circle (at 0.0 -2.54) (size 1.7 1.7) (drill 1.0) (layers "*.Cu" "*.Mask") (remove_unused_layers) (uuid "c43c26e4-c0d5-47f6-ade0-a0cbb8446566"))
+  (pad "1" thru_hole circle (at 0.0 2.54) (size 1.7 1.7) (drill 1.0) (layers "*.Cu" "*.Mask") (remove_unused_layers) (uuid "fe4a99f7-185b-4710-9aa1-0149049bfda4"))
+  (pad "2" thru_hole circle (at 0.0 -2.54) (size 1.7 1.7) (drill 1.0) (layers "*.Cu" "*.Mask") (remove_unused_layers) (uuid "2379c3d9-5c51-4b50-adf2-892866019ba7"))
 )

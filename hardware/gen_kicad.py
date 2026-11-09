@@ -65,27 +65,36 @@ def sym_def(name, spec):
     """Return the (symbol ...) definition lines — used in the .kicad_sym library
     AND embedded in the .kicad_sch so the schematic is self-contained."""
     x1, y1, x2, y2 = spec["rect"]
-    lines = [f'  (symbol "{name}"',
-             '    (pin_numbers hide)',
-             '    (pin_names (offset 1.016) hide)',
-             '    (exclude_from_sim no)',
-             '    (in_bom yes)',
-             '    (on_board yes)',
-             f'    (property "Reference" "{spec["ref"]}" (at 0 {y2-2.54} 0) (effects (font (size 1.27 1.27))))',
-             f'    (property "Value" "{spec["value"]}" (at 0 {y1+2.54} 0) (effects (font (size 1.27 1.27))))',
-             '    (property "Footprint" "" (at 0 0 0) (effects (font (size 1.27 1.27)) hide))',
-             '    (property "Datasheet" "" (at 0 0 0) (effects (font (size 1.27 1.27)) hide))',
-             f'    (symbol "{name}_1_1"',
-             '      (pin_names (offset 1.016) hide)',
-             f'      (rectangle (start {x1} {y1}) (end {x2} {y2}) (stroke (width 0.254) (type default)) (fill (type background)))']
+    lines = [f'  (symbol "{name}"']
+    if spec.get("ref") == "#PWR":
+        lines.append('    (power global)')
+    lines.append('    (pin_numbers hide)')
+    lines.append('    (pin_names (offset 1.016) hide)')
+    lines.append('    (exclude_from_sim no)')
+    lines.append('    (in_bom yes)')
+    lines.append('    (on_board yes)')
+    lines.append(f'    (property "Reference" "{spec["ref"]}" (at 0 {y2-2.54} 0) (effects (font (size 1.27 1.27))))')
+    lines.append(f'    (property "Value" "{spec["value"]}" (at 0 {y1+2.54} 0) (effects (font (size 1.27 1.27))))')
+    lines.append('    (property "Footprint" "" (at 0 0 0) (effects (font (size 1.27 1.27)) hide))')
+    lines.append('    (property "Datasheet" "" (at 0 0 0) (effects (font (size 1.27 1.27)) hide))')
+    lines.append(f'    (symbol "{name}_1_1"')
+    lines.append('      (pin_names (offset 1.016) hide)')
+    lines.append(f'      (rectangle (start {x1} {y1}) (end {x2} {y2}) (stroke (width 0.254) (type default)) (fill (type background)))')
     for pn, pnum, px, py in spec["pins"]:
-        etype = "passive"
-        if pn in ("5V", "VCC", "3V3", "VBUS"):
+        if spec.get("ref") == "#PWR":
             etype = "power_in"
-        if pn == "GND":
-            etype = "power_in"
-        lines.append(f'      (pin {etype} line (at {px} {py} 0) (length 2.54) '
-                     f'(name "{pn}" (effects (font (size 1.27 1.27)))) '
+            angle = 270 if spec["value"] == "GND" else 90
+            name = ""
+            length = 0
+        else:
+            etype = "passive"
+            if pn in ("5V", "VCC", "3V3", "VBUS", "+5V", "+3V3", "GND"):
+                etype = "power_in"
+            angle = 0
+            name = pn
+            length = 2.54
+        lines.append(f'      (pin {etype} line (at {px} {py} {angle}) (length {length}) '
+                     f'(name "{name}" (effects (font (size 1.27 1.27)))) '
                      f'(number "{pnum}" (effects (font (size 1.27 1.27)))))')
     lines.append('    )')
     lines.append('  )')
@@ -171,32 +180,84 @@ PIN_NETS = {
 # Schematic
 # =========================================================================
 def gen_schematic():
+    # Clean manual layout (signal flow left -> center -> right).
+    POS = {
+        "U1": (140, 85),    # ESP32-S3 center
+        "U3": (230, 150),   # BH1750 top-right
+        "J1": (60, 105),    # RJ45 BOTTOM left
+        "J2": (60, 55),     # RJ45 TOP left
+        "J3": (40, 155),    # 5V IN top-left
+        "J4": (250, 90),    # USB-A strip far-right
+        "Q1": (230, 80),    # MOSFET right
+        "R1": (190, 55),    # 10k gate pulldown
+        "R2": (230, 130),   # 330 LED resistor
+        "D1": (260, 130),   # LED
+    }
     out = ['(kicad_sch (version 20260306) (generator "eeschema")',
            f'  (uuid "{u()}")',
            '  (paper "A3")',
            '  (lib_symbols)']
-    for ref, sym, value, fp, sx, sy in COMPS:
-        out.append(f'  (symbol (lib_id "lights_control:{sym}") (at {sx} {sy} 0) (unit 1) (uuid "{u()}")')
-        out.append(f'    (property "Reference" "{ref}" (at {sx} {sy-10.16} 0) (effects (font (size 1.27 1.27))))')
-        out.append(f'    (property "Value" "{value}" (at {sx} {sy+10.16} 0) (effects (font (size 1.27 1.27))))')
-        out.append(f'    (property "Footprint" "lights_control:{fp}" (at {sx} {sy} 0) (effects (font (size 1.27 1.27)) hide))')
+
+    def sym_inst(lib, at, ref, value, fp):
+        sx, sy = at
+        out.append(f'  (symbol (lib_id "{lib}") (at {sx} {sy} 0) (unit 1) (uuid "{u()}")')
+        out.append(f'    (property "Reference" "{ref}" (at {sx} {sy-8.89} 0) (effects (font (size 1.27 1.27))))')
+        out.append(f'    (property "Value" "{value}" (at {sx} {sy+8.89} 0) (effects (font (size 1.27 1.27))))')
+        out.append(f'    (property "Footprint" "{fp}" (at {sx} {sy} 0) (effects (font (size 1.27 1.27)) hide))')
         out.append(f'    (property "Datasheet" "" (at {sx} {sy} 0) (effects (font (size 1.27 1.27)) hide))')
-        for pn, pnum, px, py in SYMBOLS[sym]["pins"]:
+        for pn, pnum, px, py in SYMBOLS[lib.split(':')[1]]["pins"]:
             out.append(f'    (pin "{pnum}" (uuid "{u()}"))')
         out.append('  )')
-    comp_by_ref = {c[0]: c for c in COMPS}
+
+    # place component symbols
+    for ref, sym, value, fp, _sx, _sy in COMPS:
+        sym_inst(f"lights_control:{sym}", POS[ref], ref, value, f"lights_control:{fp}")
+
+    # absolute pin positions
+    pin_abs = {}
+    for ref, sym, value, fp, _sx, _sy in COMPS:
+        sx, sy = POS[ref]
+        for pn, pnum, px, py in SYMBOLS[sym]["pins"]:
+            pin_abs[(ref, pnum)] = (sx + px, sy + py)
+
+    def wire(pts):
+        seg = " ".join(f"(xy {x:.2f} {y:.2f})" for x, y in pts)
+        out.append(f'  (wire (pts {seg}) (stroke (width 0) (type default)) (uuid "{u()}"))')
+
+    POWER = {"+5V", "GND", "+3V3"}
+
+    # group pins by net
+    net_pins = {}
     for (ref, pnum), net in PIN_NETS.items():
-        sym = comp_by_ref[ref][1]
-        sx, sy = comp_by_ref[ref][4], comp_by_ref[ref][5]
-        px = py = 0
-        for pn, pn2, pxx, pyy in SYMBOLS[sym]["pins"]:
-            if pn2 == pnum:
-                px, py = pxx, pyy
-                break
-        angle = 0 if px > 0 else 180
-        lx = sx + px + (2.54 if px > 0 else -2.54)
-        out.append(f'  (global_label "{net}" (at {lx:.2f} {sy+py:.2f} {angle}) (effects (font (size 1.27 1.27)) (justify left)) (uuid "{u()}")'
-                   f' (property "Intersheetrefs" "${net}" (at 0 0 0) (effects (font (size 1.27 1.27)) hide)))')
+        if net:
+            net_pins.setdefault(net, []).append((ref, pnum))
+
+    # signal nets: dogleg wires (sorted left->right) + a net label
+    for net, pins in net_pins.items():
+        if net in POWER:
+            continue
+        pts = sorted([pin_abs[(r, p)] for r, p in pins], key=lambda q: q[0])
+        if len(pts) < 2:
+            continue
+        lx, ly = pts[0]
+        out.append(f'  (label "{net}" (at {lx:.2f} {ly:.2f} 0) (effects (font (size 1.27 1.27)) (justify left bottom)) (uuid "{u()}"))')
+        for i in range(len(pts) - 1):
+            xa, ya = pts[i]; xb, yb = pts[i + 1]
+            if ya == yb or xa == xb:
+                wire([(xa, ya), (xb, yb)])
+            else:
+                xm = (xa + xb) / 2.0
+                wire([(xa, ya), (xm, ya)])
+                wire([(xm, ya), (xm, yb)])
+                wire([(xm, yb), (xb, yb)])
+
+    # power nets: global label at each power pin (standard power-flag style)
+    for net in POWER:
+        for ref, pnum in net_pins.get(net, []):
+            x, y = pin_abs[(ref, pnum)]
+            out.append(f'  (global_label "{net}" (at {x:.2f} {y:.2f} 0) (effects (font (size 1.27 1.27)) (justify left)) (uuid "{u()}")'
+                       f' (property "Intersheetrefs" "${net}" (at 0 0 0) (effects (font (size 1.27 1.27)) hide)))')
+
     out.append(')')
     with open(SCH, "w") as f:
         f.write('\n'.join(out) + '\n')
