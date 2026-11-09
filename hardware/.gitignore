@@ -2,3 +2,5 @@
 __pycache__/
 fp-info-cache
 lights_control-backups/
+*.lck
+~*
